@@ -164,6 +164,7 @@ class Spider(HostSpider):
     MASTER_SECRET_XOR = 41
     DETAIL_PREFIX = "atvp_detail:"
     GROUP_PREFIX = "atvp_group:"
+    RESUME_PREFIX = "atvp_resume:"
     PUSH_PREFIX = "push://"
     CHECK_LINK_HOSTS = (
         "alipan.com", "aliyundrive.com", "123pan.com", "123pan.cn",
@@ -199,6 +200,7 @@ class Spider(HostSpider):
         self._detail_result_cache = {}
         self._search_keyword_cache = {}
         self._play_context_cache = {}
+        self._resume_context_cache = {}
         self._filters = []
 
     def init(self, extend=""):
@@ -932,7 +934,189 @@ class Spider(HostSpider):
             return None
         return source_id, group_index
 
-    def _parse(self, share_url):
+    def _encode_resume_id(self, context):
+        payload = {
+            "id": str(context.get("id") or ""),
+            "playlist": int(context.get("playlist") or 0),
+        }
+        for key in ("group", "source", "subgroup"):
+            value = context.get(key)
+            if value is not None:
+                payload[key] = int(value)
+        name = str(context.get("subgroupName") or "").strip()
+        if name:
+            payload["subgroupName"] = name
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return self.RESUME_PREFIX + encoded
+
+    def _decode_resume_id(self, vod_id):
+        value = str(vod_id or "").strip()
+        if not value.startswith(self.RESUME_PREFIX):
+            return None
+        try:
+            encoded = value[len(self.RESUME_PREFIX):]
+            encoded += "=" * (-len(encoded) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(
+                encoded.encode("ascii")
+            ).decode("utf-8"))
+            source_id = str(payload.get("id") or "")
+            playlist_index = int(payload.get("playlist"))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not source_id or playlist_index < 0:
+            return None
+        context = {"id": source_id, "playlist": playlist_index}
+        # 跨端同步坐标(atv-player 多级导航);旧格式 resume id 没有这些键。
+        for key in ("group", "source", "subgroup"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            try:
+                context[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        name = str(payload.get("subgroupName") or "").strip()
+        if name:
+            context["subgroupName"] = name
+        return context
+
+    def _resume_entries(self, vod):
+        """按分组返回网盘资源链接:[[group0 的 media url...], [group1 的...]]。
+
+        无有效资源的分组不产生条目,与 atv-player 侧过滤空分组后的坐标一致。
+        """
+        entries = []
+        groups = vod.get("group") if isinstance(vod, dict) else None
+        if isinstance(groups, list):
+            for group in groups:
+                if not isinstance(group, dict) or not isinstance(group.get("media"), list):
+                    continue
+                media_urls = []
+                for media in group["media"]:
+                    if not isinstance(media, dict):
+                        continue
+                    target = str(media.get("url") or "").strip()
+                    if target:
+                        media_urls.append(target)
+                if media_urls:
+                    entries.append(media_urls)
+            if entries:
+                return entries
+
+        for url_group in str(vod.get("vod_play_url") or "").split("$$$"):
+            selected = ""
+            for episode in str(url_group or "").split("#"):
+                label, separator, target = str(episode or "").partition("$")
+                candidate = str(target if separator else label).strip()
+                if candidate:
+                    selected = candidate
+                    break
+            if selected:
+                entries.append([selected])
+        return entries
+
+    def _select_resume_target(self, vod, context):
+        """优先用跨端坐标 (group, source) 定位网盘资源;旧格式/坐标越界退回平铺 playlist。"""
+        entries = self._resume_entries(vod)
+        group_index = context.get("group")
+        source_index = context.get("source")
+        if group_index is not None and 0 <= group_index < len(entries):
+            media_urls = entries[group_index]
+            if source_index is None:
+                source_index = 0
+            if 0 <= source_index < len(media_urls):
+                return media_urls[source_index]
+        targets = [target for media_urls in entries for target in media_urls]
+        playlist_index = int(context.get("playlist") or 0)
+        if playlist_index >= len(targets):
+            raise ValueError(f"Atvp resume source not found: {context.get('id')}")
+        return targets[playlist_index]
+
+    def _remember_resume_contexts(self, vod):
+        if not isinstance(vod, dict):
+            return
+        source_id = str(vod.get("vod_id") or "").strip()
+        decoded = self._decode_resume_id(source_id)
+        if decoded is not None:
+            source_id = decoded["id"]
+        if not source_id:
+            return
+        flat_index = 0
+        for group_index, media_urls in enumerate(self._resume_entries(vod)):
+            for source_index, target in enumerate(media_urls):
+                value = str(target or "").strip()
+                if value.startswith(self.PUSH_PREFIX):
+                    value = value[len(self.PUSH_PREFIX):].strip()
+                share_url = self._decode_parse(value)
+                if share_url is not None:
+                    self._resume_context_cache[share_url] = {
+                        "id": source_id,
+                        "playlist": flat_index,
+                        "group": group_index,
+                        "source": source_index,
+                    }
+                flat_index += 1
+
+    def _apply_resume_context(self, result, context):
+        vod_list = result.get("list") if isinstance(result, dict) else None
+        if not isinstance(vod_list, list):
+            return result
+        payload = dict(result)
+        encoded_id = self._encode_resume_id(context)
+        payload["list"] = [
+            dict(vod, vod_id=encoded_id) if isinstance(vod, dict) else vod
+            for vod in vod_list
+        ]
+        return payload
+
+    def _reorder_resume_lines(self, parsed_result, context):
+        """跨端续播时把记录中的子目录线路排到第一位。
+
+        宿主(FongMi)按 vodFlag 匹配线路,匹配不上就回退第一条线路;
+        服务端线路名经公共前后缀裁剪(如 "S02【2019】"→"2【2019"),与记录里的
+        真实目录名常常对不上,不调序就会回落到第一个子目录。
+        """
+        if not isinstance(parsed_result, dict):
+            return parsed_result
+        vod_list = parsed_result.get("list")
+        if not isinstance(vod_list, list):
+            return parsed_result
+        subgroup_index = context.get("subgroup")
+        subgroup_name = str(context.get("subgroupName") or "").strip()
+        if subgroup_index is None and not subgroup_name:
+            return parsed_result
+        payload = dict(parsed_result)
+        payload["list"] = [
+            self._reorder_vod_lines(vod, subgroup_index, subgroup_name)
+            if isinstance(vod, dict) else vod
+            for vod in vod_list
+        ]
+        return payload
+
+    def _reorder_vod_lines(self, vod, subgroup_index, subgroup_name):
+        from_groups = str(vod.get("vod_play_from") or "").split("$$$")
+        url_groups = str(vod.get("vod_play_url") or "").split("$$$")
+        if len(from_groups) != len(url_groups) or len(from_groups) < 2:
+            return vod
+        target = None
+        if subgroup_index is not None and 0 <= int(subgroup_index) < len(from_groups):
+            target = int(subgroup_index)
+        else:
+            for index, flag in enumerate(from_groups):
+                if str(flag or "").strip() and str(flag or "").strip() == subgroup_name:
+                    target = index
+                    break
+        if target is None or target == 0:
+            return vod
+        order = [target] + [index for index in range(len(from_groups)) if index != target]
+        updated = dict(vod)
+        updated["vod_play_from"] = "$$$".join(from_groups[index] for index in order)
+        updated["vod_play_url"] = "$$$".join(url_groups[index] for index in order)
+        return updated
+
+    def _parse(self, share_url, resume_context=None):
         api = self._build_backend_endpoint("parse")
         share_url = str(share_url or "").strip()
         cached_vod = self._detail_result_cache.get(share_url)
@@ -954,6 +1138,13 @@ class Spider(HostSpider):
         parsed_result = self._run_filters("parse", parsed_result, {"share_url": share_url})
         parsed_result = self._run_filters("detail", parsed_result, {"share_url": share_url, "source": "parse"})
         parsed_result = self._check_detail_links(parsed_result)
+        context = resume_context or self._resume_context_cache.get(share_url)
+        if context is not None:
+            parsed_result = self._reorder_resume_lines(parsed_result, context)
+            parsed_result = self._apply_resume_context(parsed_result, context)
+        if isinstance(parsed_result, dict):
+            parsed_result = dict(parsed_result)
+            parsed_result["_atvp_backend_parse"] = True
         self._cache_detail_result(parsed_result, keyword)
         self._cache_play_context(parsed_result)
         return parsed_result
@@ -1017,6 +1208,7 @@ class Spider(HostSpider):
         for vod in vod_list:
             if not isinstance(vod, dict):
                 continue
+            self._remember_resume_contexts(vod)
             vod_name = str(vod.get("vod_name") or "").strip()
             from_groups = str(vod.get("vod_play_from") or "").split("$$$")
             url_groups = str(vod.get("vod_play_url") or "").split("$$$")
@@ -1326,6 +1518,16 @@ class Spider(HostSpider):
         print('detailContent', ids)
         if isinstance(ids, (list, tuple)) and len(ids) == 1:
             raw_id = str(ids[0] or "").strip()
+            resume_context = self._decode_resume_id(raw_id)
+            if resume_context is not None:
+                direct_share_url = self._decode_parse(resume_context["id"])
+                if direct_share_url is not None:
+                    return self._parse(direct_share_url, resume_context)
+                vod = self._load_category_detail_vod(resume_context["id"])
+                share_url = self._decode_parse(self._select_resume_target(vod, resume_context))
+                if share_url is None:
+                    raise ValueError(f"Atvp resume source is not a drive link: {resume_context['id']}")
+                return self._parse(share_url, resume_context)
             share_url = self._decode_parse(raw_id)
             if share_url is not None:
                 resolved_url = self._resolve_deferred_share_url(raw_id, share_url)

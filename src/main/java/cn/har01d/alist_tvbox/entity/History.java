@@ -43,4 +43,28 @@ public class History {
 
     private int episode = -1;
     private Integer uid = 1;
+
+    // 多端播放记录同步:规范化身份与冲突时钟(可空;仅新协议路径填充)
+    private String syncScope;
+    private String sourceKind;
+    private String sourceKey;
+    private String sourceName;
+    // 网盘/电报源的 vod_id 是 URL 编码的 JSON,可达数百字符,VARCHAR(255) 会溢出;身份列不可截断
+    @Column(columnDefinition = "TEXT")
+    private String vodId;
+    private Long updatedAt;
+    private Long changeSeq;
+    private String clientKey;
+    private Integer playlistIndex;
+    private Integer sourceGroupIndex;
+    private Integer sourceIndex;
+    private Integer sourceSubgroupIndex;
+    private String sourceSubgroupName;
+    @Column(columnDefinition = "TEXT")
+    private String driveDirId;
+    // 网盘播放内容的跨端规范标识:分享身份(盘类型@分享ID@提取码)+ 资源内相对路径(含文件名),
+    // 由服务端从网盘播放 id 的 proxyId 解析生成,不随会话/列表顺序漂移
+    private String driveShareKey;
+    @Column(columnDefinition = "TEXT")
+    private String drivePath;
 }
