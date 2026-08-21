@@ -1,5 +1,6 @@
 package cn.har01d.alist_tvbox.config;
 
+import cn.har01d.alist_tvbox.dto.DanmakuConfig;
 import cn.har01d.alist_tvbox.tvbox.Site;
 import cn.har01d.alist_tvbox.util.Constants;
 import lombok.Data;
@@ -25,9 +26,14 @@ public class AppProperties {
     private boolean enableHttps;
     private boolean cleanInvalidShares;
     private boolean enabledToken;
+    // 直播平台首页热门展示方式:mix=热门直播间混排在分类文件夹前;folder=入口为"热门直播间"文件夹;none=仅分类文件夹
+    private String liveHotMode = "folder";
     private boolean playbackSyncEnabled = false;
     // 同步分区粒度:uid(不分桶)/ token(按 vod token)/ subscription(按 vod token/id)
     private String playbackSyncScope = "token";
+    // 同一身份 item 删除的生效限频(ms):异常/旧版客户端会把同一条删除每分钟重发,
+    // 每次都携带新的 deletedAt,追杀其他端刚复活的记录;窗口内的重复删除按回声丢弃。0=关闭。
+    private long playbackDeleteThrottleMs = 600_000;
     private int pageSize = 100;
     private int maxSearchResult = 60;
     private String secretKey;
@@ -65,6 +71,8 @@ public class AppProperties {
     private List<Site> sites;
     private List<String> excludedPaths;
     private Map<String, Map<String, Object>> localProxyConfig = defaultLocalProxyConfig();
+    // 直播弹幕渲染配置,由 SettingService 从 Setting 表 danmaku_config 加载热缓存
+    private DanmakuConfig danmakuConfig = new DanmakuConfig();
 
     public static Map<String, Map<String, Object>> defaultLocalProxyConfig() {
         Map<String, Map<String, Object>> map = new HashMap<>();
