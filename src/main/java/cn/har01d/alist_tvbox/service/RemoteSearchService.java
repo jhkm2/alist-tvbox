@@ -1,6 +1,8 @@
 package cn.har01d.alist_tvbox.service;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.domain.DriveId;
+import cn.har01d.alist_tvbox.domain.SearchTargets;
 import cn.har01d.alist_tvbox.dto.ShareLink;
 import cn.har01d.alist_tvbox.dto.pansou.MergedLink;
 import cn.har01d.alist_tvbox.dto.pansou.PanSouSearchResponse;
@@ -18,24 +20,18 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.domain.Sort;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
-import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -44,13 +40,12 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -89,10 +84,10 @@ public class RemoteSearchService {
     private final TvBoxService tvBoxService;
     private final OfflineDownloadService offlineDownloadService;
     private final SubscriptionSourceService subscriptionSourceService;
+    private final PanSouClient panSouClient;
+    private final PanLinkCheckService panLinkCheckService;
     private List<String> panSouDefaultChannels;
     private List<String> panSouBuiltinChannels;
-    private String panSouToken;
-    private String checkedPanSouUrl;
     // holds one grouped search result set per short cache id so the folder
     // drill-down can page through it without hitting PanSou again.
     private final Cache<String, List<Message>> groupCache = Caffeine.newBuilder()
@@ -107,7 +102,9 @@ public class RemoteSearchService {
                                ShareService shareService,
                                TvBoxService tvBoxService,
                                OfflineDownloadService offlineDownloadService,
-                               SubscriptionSourceService subscriptionSourceService) {
+                               SubscriptionSourceService subscriptionSourceService,
+                               PanSouClient panSouClient,
+                               PanLinkCheckService panLinkCheckService) {
         this.appProperties = appProperties;
         this.restTemplate = restTemplateBuilder.build();
         this.objectMapper = objectMapper;
@@ -116,53 +113,17 @@ public class RemoteSearchService {
         this.tvBoxService = tvBoxService;
         this.offlineDownloadService = offlineDownloadService;
         this.subscriptionSourceService = subscriptionSourceService;
+        this.panSouClient = panSouClient;
+        this.panLinkCheckService = panLinkCheckService;
     }
 
-    @PostConstruct
-    public void setup() {
-        refreshPanSouInfoAsync();
-    }
-
+    /** PanSou 健康信息(供 /api/pansou 展示):健康/auth/频道来自 {@link PanSouClient},补充项目频道数。 */
     public ObjectNode getPanSouInfo() {
-        String url = appProperties.getPanSouUrl();
-        ObjectNode info = restTemplate.getForObject(url + "/api/health", ObjectNode.class);
+        ObjectNode info = panSouClient.getPanSouInfo();
         if (info != null) {
-            checkedPanSouUrl = StringUtils.defaultString(url);
-            updatePanSouAuthEnabled(info);
             info.put("project_channels_count", getProjectChannels().size());
         }
         return info;
-    }
-
-    public void refreshPanSouInfoAsync() {
-        String url = appProperties.getPanSouUrl();
-        checkedPanSouUrl = StringUtils.defaultString(url);
-        if (StringUtils.isBlank(url)) {
-            appProperties.setPanSouAuthEnabled(null);
-            return;
-        }
-        appProperties.setPanSouAuthEnabled(null);
-        CompletableFuture.runAsync(() -> {
-            try {
-                getPanSouInfo();
-            } catch (Exception e) {
-                log.warn("check PanSou health failed: {}", url, e);
-                appProperties.setPanSouAuthEnabled(null);
-            }
-        });
-    }
-
-    private void refreshPanSouInfoIfUrlChanged() {
-        String url = appProperties.getPanSouUrl();
-        if (checkedPanSouUrl != null && !StringUtils.equals(StringUtils.defaultString(url), checkedPanSouUrl)) {
-            refreshPanSouInfoAsync();
-        }
-    }
-
-    private void updatePanSouAuthEnabled(ObjectNode info) {
-        if (info.has("auth_enabled")) {
-            appProperties.setPanSouAuthEnabled(info.get("auth_enabled").asBoolean(false));
-        }
     }
 
     public MovieList pansou(String keyword) {
@@ -356,16 +317,28 @@ public class RemoteSearchService {
     }
 
     public List<Message> search(String keyword, List<String> channels) {
-        return search(keyword, channels, null);
+        return doSearch(keyword, channels, null, null);
+    }
+
+    /** 追剧口径:盘搜按订阅定向集({@link SearchTargets})服务端定向 + 结果本地门禁,null = 观影全局口径。 */
+    public List<Message> search(String keyword, List<String> channels, SearchTargets targets) {
+        return doSearch(keyword, channels, null, targets);
     }
 
     public List<Message> search(String keyword, List<String> channels, String siteKey) {
+        return doSearch(keyword, channels, siteKey, null);
+    }
+
+    private List<Message> doSearch(String keyword, List<String> channels, String siteKey, SearchTargets targets) {
         JsonNode sourceConfig = pansouSourceConfig(siteKey);
         var request = new SearchRequest(keyword, getSearchChannels(channels), resolvePanSouSource(sourceConfig));
         request.setExt(Map.of("referer", "https://dm.xueximeng.com"));
         boolean offlineDownloadEnabled = offlineDownloadService.getConfig().enabled();
         if (StringUtils.isNotBlank(keyword)) {
-            request.setCloudTypes(getPanSouCloudTypes());
+            List<String> cloudTypes = resolveCloudTypes(targets);
+            if (!cloudTypes.isEmpty()) {
+                request.setCloudTypes(cloudTypes);
+            }
         }
         if (!CollectionUtils.isEmpty(appProperties.getPanSouPlugins())) {
             request.setPlugins(appProperties.getPanSouPlugins());
@@ -390,7 +363,7 @@ public class RemoteSearchService {
             var json = searchPanSou(url, request);
             var response = objectMapper.readValue(json, PanSouSearchResponse.class);
             List<Message> messages = new ArrayList<>();
-            addMergedMessages(response.getSearchResponse().getMergedByType(), keyword, offlineDownloadEnabled, messages);
+            addMergedMessages(response.getSearchResponse().getMergedByType(), keyword, offlineDownloadEnabled, messages, targets);
             if (!messages.isEmpty()) {
                 return filterInvalidPanSouLinks(messages.stream().sorted(comparator()).distinct().toList());
             }
@@ -399,7 +372,6 @@ public class RemoteSearchService {
             if (results == null) {
                 return messages;
             }
-            List<String> tgDrivers = appProperties.getTgDrivers();
             for (var result : results) {
                 if (!isMatched(result, keyword)) {
                     log.debug("ignore PanSou result '{}' because it does not match keyword '{}'", result.getTitle(), keyword);
@@ -414,7 +386,7 @@ public class RemoteSearchService {
                         continue;
                     }
                     var message = new Message(result, link);
-                    if (tgDrivers.isEmpty() || tgDrivers.contains(message.getType())) {
+                    if (resultTypeAllowed(message.getType(), targets)) {
                         messages.add(message);
                     }
                 }
@@ -425,327 +397,73 @@ public class RemoteSearchService {
         }
     }
 
-    List<Message> selectCheckable(List<Message> messages) {
-        Set<String> enabledLinkCheckTypes = getEnabledLinkCheckTypes();
-        return messages.stream()
-                .filter(message -> !isOfflineDownloadType(message.getType()))
-                .filter(message -> StringUtils.isNotBlank(getPanSouCloudType(message.getType())))
-                .filter(message -> enabledLinkCheckTypes.contains(getPanSouCloudType(message.getType())))
-                .toList();
-    }
-
-    private Set<String> getEnabledLinkCheckTypes() {
-        List<String> configured = appProperties.getPanSouLinkCheckTypes();
-        if (CollectionUtils.isEmpty(configured)) {
-            return PAN_SOU_CHECK_TYPES;
+    /**
+     * 盘搜 cloud_types 定向:盘白名单非空按白名单映射,否则全局 tg.drivers(现状);磁力兜底生效
+     * 追加 magnet/ed2k。pan 部分为空返回空表(不发送 —— 不限模式服务端本就返回离线类型,
+     * 单发离线列表会把网盘结果裁光)。
+     */
+    private List<String> resolveCloudTypes(SearchTargets targets) {
+        List<String> base;
+        if (targets != null && !targets.drives().isEmpty()) {
+            base = targets.drives().stream()
+                    .map(DriveId::toTypeLeniently)
+                    .filter(Objects::nonNull)
+                    .map(type -> PanSouClient.cloudType(String.valueOf(type)))
+                    .filter(StringUtils::isNotBlank)
+                    .distinct()
+                    .toList();
+        } else {
+            base = getPanSouCloudTypes();
         }
-        return configured.stream()
-                .filter(PAN_SOU_CHECK_TYPES::contains)
-                .collect(Collectors.toSet());
+        if (base.isEmpty() || targets == null || !targets.offlineIncluded()) {
+            return base;
+        }
+        List<String> withOffline = new ArrayList<>(base);
+        if (!withOffline.contains("magnet")) {
+            withOffline.add("magnet");
+        }
+        if (!withOffline.contains("ed2k")) {
+            withOffline.add("ed2k");
+        }
+        return withOffline;
     }
 
+    /**
+     * 结果本地盘门禁:定向集(null = 观影全局口径)——盘白名单非空时替换全局 tg.drivers
+     * (订阅生效盘优先);白名单空时网盘维持现状;离线类型不在此收口(telegram 聚合出口的
+     * 定向门禁统一裁决)。targets==null 逐字保留两条路径的存量差异(merged 恒放行离线,
+     * results 按 tg.drivers)。
+     */
+    private boolean mergedTypeAllowed(String messageType, SearchTargets targets) {
+        if (targets == null) {
+            List<String> tgDrivers = appProperties.getTgDrivers();
+            return isOfflineDownloadType(messageType) || tgDrivers.isEmpty() || tgDrivers.contains(messageType);
+        }
+        if (SearchTargets.isOfflineType(messageType)) {
+            return true;
+        }
+        if (targets.drives().isEmpty()) {
+            List<String> tgDrivers = appProperties.getTgDrivers();
+            return tgDrivers.isEmpty() || tgDrivers.contains(messageType);
+        }
+        return targets.allowsDrive(messageType);
+    }
+
+    private boolean resultTypeAllowed(String messageType, SearchTargets targets) {
+        if (targets == null) {
+            List<String> tgDrivers = appProperties.getTgDrivers();
+            return tgDrivers.isEmpty() || tgDrivers.contains(messageType);
+        }
+        return mergedTypeAllowed(messageType, targets);
+    }
+
+    /** 盘检过滤(搜索即过滤):bad/uncertain 剔除、ok/locked 盖 validityState —— 实现在 {@link PanLinkCheckService}。 */
     public List<Message> filterInvalidPanSouLinks(List<Message> messages) {
-        if (!appProperties.isPanSouLinkCheckEnabled() || messages.isEmpty()) {
-            return messages;
-        }
-        List<Message> checkable = selectCheckable(messages);
-        log.debug("filterInvalidPanSouLinks totla={} checkable={} threashold={}", messages.size(), checkable.size(), appProperties.getPanSouLinkCheckMaxCount());
-        if (checkable.isEmpty() || checkable.size() > appProperties.getPanSouLinkCheckMaxCount()) {
-            return messages;
-        }
-
-        Map<String, String> states = new java.util.HashMap<>();
-        Map<String, String> summaries = new java.util.HashMap<>();
-        long startedAt = System.currentTimeMillis();
-        ObjectNode response = null;
-        try {
-            response = checkPanSouLinks(buildPanSouLinkCheckRequest(checkable));
-        } catch (Exception e) {
-            log.warn("check PanSou search links failed", e);
-        }
-        if (response != null && response.has("results") && response.get("results").isArray()) {
-            response.get("results").forEach(result -> {
-                if (result.has("url") && result.has("state")) {
-                    String url = result.get("url").asText();
-                    states.put(url, result.get("state").asText());
-                    if (result.has("summary")) {
-                        summaries.put(url, result.get("summary").asText());
-                    }
-                }
-            });
-        }
-        logPanSouLinkCheck(checkable, states, startedAt);
-        if (states.isEmpty()) {
-            return messages;
-        }
-        return messages.stream()
-                .filter(message -> !isInvalidPanSouCheckState(states.get(message.getLink())))
-                .peek(message -> {
-                    if (states.containsKey(message.getLink())) {
-                        String state = states.get(message.getLink());
-                        message.setValidityState(state);
-                        message.setValiditySummary(StringUtils.defaultIfBlank(summaries.get(message.getLink()), getPanSouLinkStateSummary(state)));
-                    }
-                })
-                .toList();
-    }
-
-    private boolean isInvalidPanSouCheckState(String state) {
-        return CHECK_STATE_BAD.equals(state) || CHECK_STATE_UNCERTAIN.equals(state);
-    }
-
-    private String getPanSouLinkStateSummary(String state) {
-        if ("locked".equals(state)) {
-            return "链接受限";
-        }
-        return "链接有效";
-    }
-
-    private ObjectNode buildPanSouLinkCheckRequest(List<Message> messages) {
-        ObjectNode request = objectMapper.createObjectNode();
-        ArrayNode items = request.putArray("items");
-        for (Message message : messages) {
-            items.addObject()
-                    .put("disk_type", getPanSouCloudType(message.getType()))
-                    .put("url", message.getLink());
-        }
-        request.put("view_token", "pansou-search-" + System.currentTimeMillis());
-        return request;
-    }
-
-    private void logPanSouLinkCheck(List<Message> checkable, Map<String, String> states, long startedAt) {
-        Map<String, int[]> stats = new LinkedHashMap<>();
-        int totalValid = 0;
-        for (Message message : checkable) {
-            String type = getPanSouCloudType(message.getType());
-            int[] counts = stats.computeIfAbsent(type, k -> new int[2]);
-            counts[0]++;
-            if (CHECK_STATE_OK.equals(states.get(message.getLink()))) {
-                counts[1]++;
-                totalValid++;
-            }
-        }
-        StringBuilder detail = new StringBuilder();
-        for (var entry : stats.entrySet()) {
-            if (detail.length() > 0) {
-                detail.append(", ");
-            }
-            detail.append(entry.getKey()).append(' ').append(entry.getValue()[1]).append('/').append(entry.getValue()[0]);
-        }
-        log.info("检测网盘链接{}条，{}条有效 [{}]，耗时{}ms", checkable.size(), totalValid, detail, System.currentTimeMillis() - startedAt);
+        return panLinkCheckService.filterInvalidPanSouLinks(messages);
     }
 
     private String searchPanSou(String url, SearchRequest request) {
-        if (!shouldUsePanSouAuth()) {
-            return restTemplate.postForObject(url, request, String.class);
-        }
-        String token = getPanSouToken();
-        if (StringUtils.isBlank(token)) {
-            return restTemplate.postForObject(url, request, String.class);
-        }
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        return restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(request, headers), String.class).getBody();
-    }
-
-    // Plugin-facing entry: fill in disk_type from the share URL when the caller omits it,
-    // then delegate to checkPanSouLinks. Lets filter/spider plugins send just URLs.
-    public ObjectNode checkLinks(ObjectNode request) {
-        if (request != null && request.has("items") && request.get("items").isArray()) {
-            for (JsonNode item : request.get("items")) {
-                if (!item.isObject()) {
-                    continue;
-                }
-                ObjectNode obj = (ObjectNode) item;
-                if (StringUtils.isBlank(obj.path("disk_type").asText(""))) {
-                    String inferred = inferDiskType(obj.path("url").asText(""));
-                    if (StringUtils.isNotBlank(inferred)) {
-                        obj.put("disk_type", inferred);
-                    }
-                }
-            }
-        }
-        return checkPanSouLinks(request);
-    }
-
-    private String inferDiskType(String url) {
-        if (StringUtils.isBlank(url)) {
-            return null;
-        }
-        String lower = url.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("magnet:")) {
-            return "magnet";
-        }
-        if (lower.startsWith("ed2k:")) {
-            return "ed2k";
-        }
-        String host;
-        try {
-            host = new URI(url).getHost();
-        } catch (Exception e) {
-            return null;
-        }
-        if (host == null) {
-            return null;
-        }
-        host = host.toLowerCase(Locale.ROOT);
-        for (String[] entry : DISK_HOST_MAP) {
-            if (host.contains(entry[0])) {
-                return entry[1];
-            }
-        }
-        return null;
-    }
-
-    public ObjectNode checkPanSouLinks(ObjectNode request) {        // Priority: dedicated 盘检地址 (PanCheck) > TG-Search > PanSou
-        if (StringUtils.isNotBlank(appProperties.getPanCheckUrl())) {
-            return checkViaPanCheck(request);
-        }
-        if (StringUtils.isNotBlank(appProperties.getTgSearch())) {
-            return checkViaTgSearch(request);
-        }
-        return checkViaPanSou(request);
-    }
-
-    // PanCheck backend (see /home/harold/workspace/PanCheck): different contract —
-    // req {links:[url...], selected_platforms:[...]}, resp bucketed by validity.
-    private ObjectNode checkViaPanCheck(ObjectNode request) {
-        ObjectNode panCheckReq = objectMapper.createObjectNode();
-        ArrayNode links = panCheckReq.putArray("links");
-        Set<String> platforms = new LinkedHashSet<>();
-        if (request.has("items") && request.get("items").isArray()) {
-            for (JsonNode item : request.get("items")) {
-                if (item.has("url")) {
-                    links.add(item.get("url").asText());
-                }
-                if (item.has("disk_type")) {
-                    platforms.add(mapPanCheckPlatform(item.get("disk_type").asText()));
-                }
-            }
-        }
-        // send selected_platforms so PanCheck runs the checkers synchronously (realtime)
-        ArrayNode selectedPlatforms = panCheckReq.putArray("selected_platforms");
-        platforms.forEach(selectedPlatforms::add);
-        String url = appProperties.getPanCheckUrl() + "/api/v1/links/check";
-        ObjectNode response = restTemplate.postForObject(url, panCheckReq, ObjectNode.class);
-        return normalizePanCheckResponse(response);
-    }
-
-    private String mapPanCheckPlatform(String diskType) {
-        return switch (diskType) {
-            case "123" -> "pan123";
-            case "115" -> "pan115";
-            case "mobile" -> "cmcc";
-            default -> diskType;
-        };
-    }
-
-    private ObjectNode normalizePanCheckResponse(ObjectNode response) {
-        ObjectNode result = objectMapper.createObjectNode();
-        ArrayNode results = result.putArray("results");
-        if (response == null) {
-            return result;
-        }
-        addPanCheckResults(results, response, "valid_links", "ok");
-        addPanCheckResults(results, response, "invalid_links", "bad");
-        addPanCheckResults(results, response, "locked_links", "locked");
-        addPanCheckResults(results, response, "pending_links", "uncertain");
-        return result;
-    }
-
-    private void addPanCheckResults(ArrayNode results, ObjectNode response, String field, String state) {
-        if (response.has(field) && response.get(field).isArray()) {
-            for (JsonNode link : response.get(field)) {
-                results.addObject()
-                        .put("url", link.asText())
-                        .put("state", state)
-                        .put("summary", getPanCheckSummary(state));
-            }
-        }
-    }
-
-    private String getPanCheckSummary(String state) {
-        return switch (state) {
-            case "ok" -> "链接有效";
-            case "bad" -> "链接失效";
-            case "locked" -> "链接受限";
-            case "uncertain" -> "状态不确定";
-            default -> state;
-        };
-    }
-
-    // TG-Search exposes the same /api/check/links contract but wraps results under "data"
-    // and authenticates via X-API-Key. Unwrap so downstream sees the canonical {results} shape.
-    private ObjectNode checkViaTgSearch(ObjectNode request) {
-        String url = appProperties.getTgSearch() + "/api/check/links";
-        // Only TG-Search exposes a server-side check timeout; honor it when configured.
-        Integer timeoutMs = appProperties.getPanCheckTimeoutMs();
-        if (timeoutMs != null && timeoutMs > 0) {
-            request.put("timeout_ms", timeoutMs);
-        }
-        HttpHeaders headers = new HttpHeaders();
-        if (StringUtils.isNotBlank(appProperties.getTgSearchApiKey())) {
-            headers.set("X-API-Key", appProperties.getTgSearchApiKey());
-        }
-        ObjectNode response = restTemplate.exchange(url, HttpMethod.POST,
-                new HttpEntity<>(request, headers), ObjectNode.class).getBody();
-        if (response != null && response.has("data") && response.get("data").isObject()) {
-            JsonNode data = response.get("data");
-            if (data.has("results")) {
-                ObjectNode normalized = objectMapper.createObjectNode();
-                normalized.set("results", data.get("results"));
-                return normalized;
-            }
-        }
-        return response == null ? objectMapper.createObjectNode() : response;
-    }
-
-    private ObjectNode checkViaPanSou(ObjectNode request) {
-        String url = appProperties.getPanSouUrl() + "/api/check/links";
-        if (!shouldUsePanSouAuth()) {
-            return restTemplate.postForObject(url, request, ObjectNode.class);
-        }
-        String token = getPanSouToken();
-        if (StringUtils.isBlank(token)) {
-            return restTemplate.postForObject(url, request, ObjectNode.class);
-        }
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        return restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(request, headers), ObjectNode.class).getBody();
-    }
-
-    private boolean hasPanSouCredentials() {
-        return StringUtils.isNoneBlank(appProperties.getPanSouUsername(), appProperties.getPanSouPassword());
-    }
-
-    private boolean shouldUsePanSouAuth() {
-        refreshPanSouInfoIfUrlChanged();
-        return hasPanSouCredentials() && Boolean.TRUE.equals(appProperties.getPanSouAuthEnabled());
-    }
-
-    private String getPanSouToken() {
-        if (StringUtils.isNotBlank(panSouToken)) {
-            return panSouToken;
-        }
-        Map<String, String> body = Map.of(
-                "username", appProperties.getPanSouUsername(),
-                "password", appProperties.getPanSouPassword());
-        Map<?, ?> response;
-        try {
-            response = restTemplate.postForObject(appProperties.getPanSouUrl() + "/api/auth/login", body, Map.class);
-        } catch (HttpClientErrorException.Forbidden e) {
-            if (e.getResponseBodyAsString().contains("认证功能未启用")) {
-                log.info("PanSou auth is disabled, use unauthenticated requests");
-                appProperties.setPanSouAuthEnabled(false);
-                return "";
-            }
-            throw e;
-        }
-        if (response == null || response.get("token") == null) {
-            throw new IllegalStateException("PanSou login failed");
-        }
-        panSouToken = response.get("token").toString();
-        return panSouToken;
+        return panSouClient.post(url, request, String.class);
     }
 
     List<String> getSearchChannels(List<String> channels) {
@@ -765,7 +483,7 @@ public class RemoteSearchService {
 
     private List<String> getPanSouBuiltinChannels() {
         if (panSouBuiltinChannels == null) {
-            ObjectNode info = getPanSouInfo();
+            ObjectNode info = panSouClient.getPanSouInfo();
             if (info == null || !info.has("channels") || !info.get("channels").isArray()) {
                 return List.of();
             }
@@ -798,17 +516,17 @@ public class RemoteSearchService {
         }
     }
 
-    private void addMergedMessages(Map<String, List<MergedLink>> mergedByType, String keyword, boolean offlineDownloadEnabled, List<Message> messages) {
+    private void addMergedMessages(Map<String, List<MergedLink>> mergedByType, String keyword, boolean offlineDownloadEnabled,
+                                   List<Message> messages, SearchTargets targets) {
         if (CollectionUtils.isEmpty(mergedByType)) {
             return;
         }
-        List<String> tgDrivers = appProperties.getTgDrivers();
         for (var entry : mergedByType.entrySet()) {
 //            if (!offlineDownloadEnabled && isOfflineDownloadType(entry.getKey())) {
 //                continue;
 //            }
             String messageType = getMessageType(entry.getKey());
-            if (messageType == null || !isEnabledDriver(messageType, tgDrivers)) {
+            if (messageType == null || !mergedTypeAllowed(messageType, targets)) {
                 continue;
             }
             for (var link : entry.getValue()) {
@@ -819,10 +537,6 @@ public class RemoteSearchService {
                 messages.add(new Message(messageType, link));
             }
         }
-    }
-
-    private boolean isEnabledDriver(String messageType, List<String> tgDrivers) {
-        return isOfflineDownloadType(messageType) || tgDrivers.isEmpty() || tgDrivers.contains(messageType);
     }
 
     private boolean isOfflineDownloadType(String type) {
@@ -871,31 +585,9 @@ public class RemoteSearchService {
                 && text.toLowerCase(Locale.ROOT).contains(token.toLowerCase(Locale.ROOT));
     }
 
-    private String getPanSouCloudType(String type) {
-        if (type == null) {
-            return null;
-        }
-        return switch (type) {
-            case "0" -> "aliyun";
-            case "1" -> "pikpak";
-            case "2" -> "xunlei";
-            case "3" -> "123";
-            case "5" -> "quark";
-            case "6" -> "mobile";
-            case "7" -> "uc";
-            case "8" -> "115";
-            case "9" -> "tianyi";
-            case "10" -> "baidu";
-            case "12" -> "guangya";
-            case "magnet" -> "magnet";
-            case "ed2k" -> "ed2k";
-            default -> null;
-        };
-    }
-
     private List<String> getPanSouCloudTypes() {
         return new ArrayList<>(appProperties.getTgDrivers().stream()
-                .map(this::getPanSouCloudType)
+                .map(PanSouClient::cloudType)
                 .filter(StringUtils::isNotBlank)
                 .distinct()
                 .toList());
@@ -903,7 +595,7 @@ public class RemoteSearchService {
 
     private List<String> getPanSouCloudTypes(boolean offlineDownloadEnabled) {
         List<String> types = new ArrayList<>(appProperties.getTgDrivers().stream()
-                .map(this::getPanSouCloudType)
+                .map(PanSouClient::cloudType)
                 .filter(type -> offlineDownloadEnabled || !isOfflineDownloadType(type))
                 .filter(StringUtils::isNotBlank)
                 .distinct()

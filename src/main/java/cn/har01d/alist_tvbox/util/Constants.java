@@ -26,6 +26,8 @@ public final class Constants {
     public static final String COLLECTION = "collection";
     public static final String LIST = "list";
     public static final String INDEX_115_NAME = "/115分享索引";
+    /** 追剧订阅固定挂载根路径:此路径下的 share 由订阅服务管理生命周期,失效不删除(自动换源),ShareService 清理豁免 */
+    public static final String SUBSCRIPTION_MOUNT_ROOT = "/追剧/";
 
     public static final String TG_DRIVERS = "9,10,5,7,8,3,2,0,6,1,12,magnet,ed2k";
 
@@ -52,6 +54,8 @@ public final class Constants {
     public static final String MOVIE_VERSION = "movie_version";
     public static final String OPEN_TOKEN_URL = "open_token_url";
     public static final String TOKEN = "token";
+    /** 用户级 vod token 前缀(u-{username}):该前缀保留给用户 token,全局 tokens 禁用,两个空间永不撞车。 */
+    public static final String USER_TOKEN_PREFIX = "u-";
     public static final String ENABLED_TOKEN = "enabled_token";
     public static final String INDEX_VERSION = "index_version";
     public static final String DOCKER_VERSION = "docker_version";

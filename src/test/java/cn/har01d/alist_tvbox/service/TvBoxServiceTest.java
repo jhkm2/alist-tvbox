@@ -109,7 +109,8 @@ class TvBoxServiceTest {
                 proxyService,
                 index115Adapter,
                 new RestTemplateBuilder(),
-                pikPakAccountRepository
+                pikPakAccountRepository,
+                org.mockito.Mockito.mock(cn.har01d.alist_tvbox.service.AccountAccessGuard.class)
         );
     }
 
@@ -419,5 +420,57 @@ class TvBoxServiceTest {
                 "天才，女友/天才女友 (2026) 4K 更新至12集【田曦薇/胡一天】",
                 "天才，女友",
                 "T 忝財钕伖");
+    }
+
+    @Test
+    void getMovieListDegradesToEmptyWhenDirectoryListingFails() {
+        // 订阅主源分享被取消(UC errno -21)一类的目录级失效:浏览接口降级为空列表,
+        // 不把上游错误原文炸成 400 Bad Request(TVBox 端整页报错)
+        org.mockito.Mockito.when(siteService.getById(1)).thenReturn(new cn.har01d.alist_tvbox.entity.Site());
+        org.mockito.Mockito.when(tenantService.valid(org.mockito.ArgumentMatchers.anyString())).thenReturn(true);
+        org.mockito.Mockito.when(aListService.listFiles(org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyInt(),
+                        org.mockito.ArgumentMatchers.anyInt()))
+                .thenThrow(new RuntimeException("{\"errno\":-21,\"show_msg\":\"来晚啦，该分享已被取消\"}"));
+
+        cn.har01d.alist_tvbox.tvbox.MovieList result =
+                tvBoxService.getMovieList(null, "web", "1$/追剧/沧元图-第三季 [bgmid-575244] S03$1", null, null, 1, 50);
+
+        org.junit.jupiter.api.Assertions.assertNotNull(result);
+        org.junit.jupiter.api.Assertions.assertTrue(result.getList().isEmpty());
+    }
+
+    @Test
+    void getSubtitleMarksAssFileAsSsaMimeType() {
+        // 播放端 MediaItemFactory 对非空 format 直用不嗅探:ass 误标 application/x-subrip
+        // 会被 ExoPlayer 的 SubRipDecoder 解析失败,表现为字幕轨可选但无字幕渲染
+        cn.har01d.alist_tvbox.entity.Site site = new cn.har01d.alist_tvbox.entity.Site();
+        String dir = "/叶卡捷琳娜大帝";
+        String video = "叶卡捷琳娜大帝.2014.S01E01.1080p.WEB-DL.H.264.mkv";
+        String sub = "叶卡捷琳娜大帝.2014.S01E01.1080p.WEB-DL.H.264.chs.ass";
+
+        cn.har01d.alist_tvbox.model.FsResponse listing = new cn.har01d.alist_tvbox.model.FsResponse();
+        cn.har01d.alist_tvbox.model.FsInfo videoInfo = new cn.har01d.alist_tvbox.model.FsInfo();
+        videoInfo.setName(video);
+        cn.har01d.alist_tvbox.model.FsInfo subInfo = new cn.har01d.alist_tvbox.model.FsInfo();
+        subInfo.setName(sub);
+        listing.setFiles(java.util.List.of(videoInfo, subInfo));
+        when(aListService.listFiles(site, dir, 1, 100)).thenReturn(listing);
+        when(appProperties.getFormats()).thenReturn(Set.of("mkv"));
+        when(appProperties.getSubtitles()).thenReturn(Set.of("srt", "ass", "vtt", "ttml"));
+
+        FsDetail subDetail = new FsDetail();
+        subDetail.setName(sub);
+        subDetail.setRawUrl("http://cdn.example/sub.chs.ass");
+        when(aListService.getFile(site, dir + "/" + sub)).thenReturn(subDetail);
+
+        cn.har01d.alist_tvbox.dto.Subtitle result = tvBoxService.getSubtitle(site, dir, video);
+
+        assertThat(result).isNotNull();
+        assertThat(result.getFormat()).isEqualTo("text/x-ssa");
+        assertThat(result.getExt()).isEqualTo("ass");
+        assertThat(result.getLang()).isEqualTo("chs");
+        assertThat(result.getName()).isEqualTo("简体中文");
+        assertThat(result.getUrl()).isEqualTo("http://cdn.example/sub.chs.ass");
     }
 }

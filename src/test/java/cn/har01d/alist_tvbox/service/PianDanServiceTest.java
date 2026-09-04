@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.client.ExpectedCount.once;
@@ -52,7 +53,9 @@ class PianDanServiceTest {
     void setUp() {
         restTemplate = new RestTemplate();
         when(builder.build()).thenReturn(restTemplate);
-        service = new PianDanService(telegramService, settingRepository, subscriptionSourceService, builder, new ObjectMapper());
+        // TmdbEndpoint 即读即用:未配置镜像回落官方直连,不改变测试里的 URL 断言
+        lenient().when(settingRepository.findById("tmdb_api_host")).thenReturn(java.util.Optional.empty());
+        service = new PianDanService(telegramService, subscriptionSourceService, builder, new ObjectMapper(), new TmdbEndpoint(settingRepository));
     }
 
     @Test
@@ -88,6 +91,8 @@ class PianDanServiceTest {
                 .extracting(Category::getType_name)
                 .containsExactly("TMDB动漫片库", "TMDB综艺片库");
         assertThat(result.getFilters().get("douban:local")).containsExactly(filter);
+        assertThat(result.getFilters().get("douban:hot_tv")).extracting(Filter::getKey).containsExactly("region");
+        assertThat(result.getFilters().get("douban:hot_movie")).extracting(Filter::getKey).containsExactly("region");
         assertThat(result.getFilters()).containsKeys(
                 "tmdb:trending",
                 "tmdb:movie_upcoming",
@@ -111,6 +116,9 @@ class PianDanServiceTest {
                         "vote_count.gte",
                         "runtime"
                 );
+        assertThat(result.getFilters().get("tmdb:tv_popular"))
+                .extracting(Filter::getKey)
+                .containsExactly("origin_group", "sort_by");
         assertThat(result.getTotal()).isEqualTo(result.getCategories().size());
     }
 
@@ -142,10 +150,13 @@ class PianDanServiceTest {
         assertThat(result.getCategories()).extracting(Category::getType_id)
                 .doesNotContain("douban:tv_domestic", "douban:movie_top250", "tmdb:movie_popular", "tmdb:platform_tv");
         assertThat(result.getFilters().get("douban:local")).containsExactly(browseFilter);
+        assertThat(result.getFilters().get("douban:hot_tv")).extracting(Filter::getKey).containsExactly("region");
         assertThat(result.getFilters().get("douban:category")).extracting(Filter::getKey).containsExactly("category");
         assertThat(result.getFilters().get("douban:billboard")).extracting(Filter::getKey).containsExactly("billboard");
-        assertThat(result.getFilters().get("tmdb:movie")).extracting(Filter::getKey).containsExactly("list");
-        assertThat(result.getFilters().get("tmdb:tv")).extracting(Filter::getKey).containsExactly("list");
+        assertThat(result.getFilters().get("tmdb:movie")).extracting(Filter::getKey)
+                .containsExactly("list", "origin_group", "sort_by");
+        assertThat(result.getFilters().get("tmdb:tv")).extracting(Filter::getKey)
+                .containsExactly("list", "origin_group", "sort_by");
         assertThat(result.getFilters()).containsKeys(
                 "tmdb:trending", "tmdb:discover_movie", "tmdb:discover_tv", "tmdb:anime", "tmdb:variety");
         assertThat(result.getTotal()).isEqualTo(12);
@@ -543,11 +554,172 @@ class PianDanServiceTest {
         server.verify();
     }
 
+    @Test
+    void subscriptionCategoryExcludesMovieCategoriesAndMovieFilterOptions() {
+        CategoryList douban = new CategoryList();
+        douban.setCategories(List.of(
+                doubanCategory("hot_tv", "热门电视剧"),
+                doubanCategory("hot_movie", "热门电影"),
+                doubanCategory("movie_top250", "电影Top250"),
+                doubanCategory("suggestion_movie", "电影推荐"),
+                doubanCategory("tv_korean", "韩剧")
+        ));
+        when(telegramService.categoryDouban()).thenReturn(douban);
+
+        CategoryList result = service.subscriptionCategory();
+
+        assertThat(result.getCategories())
+                .extracting(Category::getType_id)
+                .doesNotContain(
+                        "douban:hot_movie", "douban:movie_top250", "douban:suggestion_movie",
+                        "tmdb:movie_popular", "tmdb:movie_top_rated", "tmdb:movie_now_playing", "tmdb:movie_upcoming",
+                        "tmdb:platform_movie", "tmdb:discover_movie")
+                .contains("douban:hot_tv", "douban:tv_korean", "tmdb:tv_popular", "tmdb:tv_on_the_air",
+                        "tmdb:trending", "tmdb:anime", "tmdb:variety", "tmdb:platform_tv", "tmdb:discover_tv");
+        assertThat(result.getCategories().get(0).getType_id()).isEqualTo("douban:hot_tv");
+        assertThat(result.getTotal()).isEqualTo(result.getCategories().size());
+        assertThat(result.getFilters().get("douban:hot_tv").get(0).getValue())
+                .extracting(FilterValue::getV)
+                .contains("", "中国大陆", "日本", "美国");
+        assertThat(result.getFilters().get("tmdb:trending").get(0).getValue())
+                .extracting(FilterValue::getV)
+                .containsExactly("all", "tv");
+        assertThat(result.getFilters().get("tmdb:anime").stream()
+                .filter(filter -> "kind".equals(filter.getKey())).findFirst().orElseThrow().getValue())
+                .extracting(FilterValue::getV)
+                .containsExactly("tv");
+    }
+
+    @Test
+    void subscriptionCategoryLiteModeExcludesMovieBillboardOptions() {
+        when(subscriptionSourceService.getBuiltinExtend("csp_PianDan")).thenReturn("{\"mode\":\"lite\"}");
+        CategoryList douban = new CategoryList();
+        douban.setCategories(List.of(
+                doubanCategory("hot_movie", "热门电影"),
+                doubanCategory("hot_tv", "热门电视剧")
+        ));
+        when(telegramService.categoryDouban()).thenReturn(douban);
+
+        CategoryList result = service.subscriptionCategory();
+
+        assertThat(result.getCategories())
+                .extracting(Category::getType_id)
+                .doesNotContain("douban:hot_movie", "tmdb:movie", "tmdb:discover_movie")
+                .contains("douban:hot_tv", "douban:billboard", "tmdb:tv", "tmdb:discover_tv");
+        assertThat(result.getFilters().get("douban:billboard").get(0).getValue())
+                .extracting(FilterValue::getV)
+                .doesNotContain("movie_top250", "movie_real_time_hotest", "movie_weekly_best", "suggestion_movie")
+                .contains("tv_real_time_hotest", "tv_chinese_best_weekly", "suggestion_tv", "tv_animation");
+        assertThat(result.getTotal()).isEqualTo(result.getCategories().size());
+    }
+
+    @Test
+    void fixedTmdbListWithoutFiltersKeepsNativeEndpoint() {
+        when(settingRepository.findById("tmdb_api_key")).thenReturn(Optional.empty());
+        MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
+        server.expect(once(), request -> {
+                    assertThat(request.getURI().getPath()).isEqualTo("/3/movie/popular");
+                    assertThat(request.getURI().getQuery()).contains("region=CN");
+                })
+                .andRespond(withSuccess("{\"results\":[]}", MediaType.APPLICATION_JSON));
+
+        service.list("tmdb:movie_popular", "", 1, 20, Map.of());
+
+        server.verify();
+    }
+
+    @Test
+    void fixedTmdbListWithRegionAndSortUpgradesToDiscover() {
+        when(settingRepository.findById("tmdb_api_key")).thenReturn(Optional.empty());
+        String futureLimit = LocalDate.now().plusDays(31).toString();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
+        server.expect(once(), request -> {
+                    assertThat(request.getURI().getPath()).isEqualTo("/3/discover/tv");
+                    assertThat(request.getURI().getQuery()).contains(
+                            "sort_by=first_air_date.desc",
+                            "with_origin_country=JP%7CKR",
+                            "first_air_date.lte=" + futureLimit
+                    );
+                })
+                .andRespond(withSuccess("{\"results\":[]}", MediaType.APPLICATION_JSON));
+
+        service.list("tmdb:tv_popular", "", 1, 20, Map.of(
+                "origin_group", "JP|KR",
+                "sort_by", "first_air_date.desc"
+        ));
+
+        server.verify();
+    }
+
+    @Test
+    void fixedTmdbListKeepsScheduleWindowAndNativeSort() {
+        when(settingRepository.findById("tmdb_api_key")).thenReturn(Optional.empty());
+        LocalDate today = LocalDate.now();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
+        server.expect(once(), request -> {
+                    assertThat(request.getURI().getPath()).isEqualTo("/3/discover/movie");
+                    assertThat(request.getURI().getQuery()).contains(
+                            "sort_by=popularity.desc",
+                            "with_origin_country=CN%7CHK%7CTW",
+                            "primary_release_date.gte=" + today.minusDays(42),
+                            "primary_release_date.lte=" + today
+                    );
+                })
+                .andRespond(withSuccess("{\"results\":[]}", MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> {
+                    assertThat(request.getURI().getPath()).isEqualTo("/3/discover/tv");
+                    assertThat(request.getURI().getQuery()).contains(
+                            "sort_by=popularity.desc",
+                            "air_date.gte=" + today,
+                            "air_date.lte=" + today
+                    );
+                })
+                .andRespond(withSuccess("{\"results\":[]}", MediaType.APPLICATION_JSON));
+        server.expect(once(), request -> {
+                    assertThat(request.getURI().getPath()).isEqualTo("/3/discover/tv");
+                    assertThat(request.getURI().getQuery()).contains(
+                            "sort_by=vote_average.desc",
+                            "vote_count.gte=50"
+                    );
+                })
+                .andRespond(withSuccess("{\"results\":[]}", MediaType.APPLICATION_JSON));
+
+        service.list("tmdb:movie_now_playing", "", 1, 20, Map.of("origin_group", "CN|HK|TW"));
+        service.list("tmdb:tv_airing_today", "", 1, 20, Map.of("sort_by", "popularity.desc"));
+        service.list("tmdb:tv_top_rated", "", 1, 20, Map.of("origin_group", "US|GB"));
+
+        server.verify();
+    }
+
     private Category doubanCategory(String typeId, String name) {
         Category category = new Category();
         category.setType_id(typeId);
         category.setType_name(name);
         category.setType_flag(0);
         return category;
+    }
+
+    @Test
+    void tmdbDetailCachedAcrossCallsWithinWindow() {
+        when(settingRepository.findById("tmdb_api_key")).thenReturn(Optional.empty());
+        MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
+        String body = "{\"name\":\"外滩探秘\",\"overview\":\"简介\",\"first_air_date\":\"2024-01-01\","
+                + "\"vote_average\":7.5,\"genres\":[{\"name\":\"纪录\"}],"
+                + "\"credits\":{\"cast\":[{\"name\":\"甲\"},{\"name\":\"乙\"}]},"
+                + "\"seasons\":[{\"season_number\":0},{\"season_number\":1,\"air_date\":\"2024-01-01\",\"episode_count\":8},"
+                + "{\"season_number\":2,\"air_date\":null,\"episode_count\":0}]}"; // S2=已续订未开播占位季
+        server.expect(once(), request -> assertThat(request.getURI().getPath()).isEqualTo("/3/tv/100757"))
+                .andRespond(withSuccess(body, MediaType.APPLICATION_JSON));
+
+        MovieDetail first = service.tmdbDetail("tv", 100757);
+        MovieDetail second = service.tmdbDetail("tv", 100757); // 「媒体信息」条目:命中缓存,不重打 TMDB
+
+        server.verify(); // 只放行一次网络请求
+        assertThat(second).isNotNull();
+        assertThat(second.getVod_name()).isEqualTo("外滩探秘");
+        assertThat(second.getType_name()).isEqualTo("纪录"); // 类型归 type_name,不再冒充演员
+        assertThat(second.getVod_actor()).isEqualTo("甲 / 乙");
+        assertThat(first).isSameAs(second);
+        assertThat((List<?>) second.getExt()).singleElement().isEqualTo(1); // season 0(特典)与未开播占位季被滤掉
     }
 }

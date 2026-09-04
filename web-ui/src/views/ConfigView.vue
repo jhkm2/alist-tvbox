@@ -208,6 +208,18 @@
         <el-form-item label="TMDB API Key">
           <el-input v-model="tmdbApiKey" type="password" show-password/>
           <el-button type="primary" @click="updateTmdbApiKey">更新</el-button>
+          <span class="hint" style="margin-left: 8px">v3 api key(32 位)或 v4 read access token(eyJ 开头)自动识别;
+            <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">到官网获取 →</a>
+          </span>
+        </el-form-item>
+        <el-form-item label="TMDB 线路">
+          <el-select v-model="tmdbApiHost" style="width: 320px"
+                    filterable allow-create default-first-option
+                    placeholder="选择预设,或输入自定义 CF Worker 反代地址">
+            <el-option v-for="opt in tmdbApiHostOptions" :key="opt.value" :label="opt.label" :value="opt.value"/>
+          </el-select>
+          <el-button type="primary" @click="updateTmdbApiHost">更新</el-button>
+          <span class="hint" style="margin-left: 8px">国内直连官方不通时切换反代;Worker 轮询池分摊各 worker 每日限额,Worker 型 API 与封面同域,NAStool 型自动分开配置图床,立即生效</span>
         </el-form-item>
         <el-form-item label="115分享本地索引" v-if="has115Account">
           <el-button type="primary" :loading="index115Loading" @click="updateIndex115">下载</el-button>
@@ -431,6 +443,12 @@ const openTokenUrl = ref('')
 const dockerAddress = ref('')
 const aliSecret = ref('')
 const tmdbApiKey = ref('')
+const tmdbApiHost = ref('')
+const tmdbApiHostOptions = [
+  {label: '官方 API(直连)', value: ''},
+  {label: 'Worker 轮询池 - round robin 分摊每日限额', value: 'https://tmdb.8866033.xyz,https://tmdb.swust-oj.workers.dev,https://tmdb.8866033.workers.dev,https://tmdb.power348045.workers.dev,https://tmdb.harold348047.workers.dev,https://tmdb.ai-09b.workers.dev,https://tmdb.root-df0.workers.dev,https://tmdb.atv-8c1.workers.dev,https://tmdb.odd-math-a42b.workers.dev,https://tmdb.test-d2c.workers.dev,https://tmdb.code-a96.workers.dev,https://tmdb.claude-b79.workers.dev'},
+  {label: 'NAStool(API + 图床分线路,自动配置)', value: 'https://tmdb.nastool.org'},
+]
 const userAgent = ref('')
 const atvPass = ref('')
 const apiKey = ref('')
@@ -521,6 +539,18 @@ const updateOpenTokenUrl = () => {
 
 const updateTmdbApiKey = () => {
   axios.post('/api/settings', {name: 'tmdb_api_key', value: tmdbApiKey.value}).then(() => {
+    ElMessage.success('更新成功')
+  })
+}
+
+const updateTmdbApiHost = () => {
+  const posts: { name: string, value: string }[] = [{name: 'tmdb_api_host', value: tmdbApiHost.value}]
+  // 图床与 API 分线路的预设(NAStool)落 tmdb_image_host,其余(官方/Worker 型,含自定义地址)一律清空走后端跟随 API 池
+  posts.push({
+    name: 'tmdb_image_host',
+    value: tmdbApiHost.value === 'https://tmdb.nastool.org' ? 'https://img.nastool.org' : '',
+  })
+  Promise.all(posts.map(post => axios.post('/api/settings', post))).then(() => {
     ElMessage.success('更新成功')
   })
 }
@@ -721,6 +751,7 @@ onMounted(() => {
     dockerAddress.value = data.docker_address
     aliSecret.value = data.ali_secret
     tmdbApiKey.value = data.tmdb_api_key
+    tmdbApiHost.value = data.tmdb_api_host || ''
     userAgent.value = data.user_agent
     autoCheckin.value = data.auto_checkin === 'true'
     aListRestart.value = data.alist_restart_required === 'true'

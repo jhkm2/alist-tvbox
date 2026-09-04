@@ -81,10 +81,18 @@ public class TokenFilter extends OncePerRequestFilter {
             }
 
             String uri = request.getRequestURI();
-            if (uri.startsWith("/open") || uri.startsWith("/node") || uri.startsWith("/cat")) {
+            if (uri.startsWith("/node") || uri.startsWith("/cat")) {
+                // 完整 basic auth 协议:无/错凭证一律 401 + WWW-Authenticate 挑战,
+                // 客户端(猫影视系,URL 内嵌凭证)凭挑战重试;basic 凭证已随订阅地址下发(含 USER)。
+                // 例外:bundle 自定义爬虫装载器的清单/爬虫/依赖请求(/node/{token}/custom|lib/**)
+                // 不带凭证,凭路径 vod token 放行——爬虫文件非敏感,配置三件套仍须完整挑战。
                 String auth = request.getHeader("Authorization");
                 boolean ok = basicAuthCredentials != null && auth != null
                         && MessageDigest.isEqual(basicAuthCredentials.getBytes(StandardCharsets.UTF_8), auth.getBytes(StandardCharsets.UTF_8));
+                if (!ok && isCustomResourcePath(uri) && hasValidVodTokenInPath(uri)) {
+                    filterChain.doFilter(request, response);
+                    return;
+                }
                 if (!ok) {
                     response.setHeader("Www-Authenticate", "Basic realm=\"alist\"");
                     response.sendError(401);
@@ -134,11 +142,36 @@ public class TokenFilter extends OncePerRequestFilter {
     private static final Set<String> TOKEN_QUERY_DOWNLOAD_PATHS = Set.of(
             "/api/settings/export", "/api/settings/export-json",
             "/api/export-shares", "/api/logs/download", "/api/index-files/download",
-            "/api/static-files/download");
+            "/api/static-files/download", "/api/cat/download");
 
     // permitAll 的播放同步端点:令牌即鉴权,由 PlaybackSyncController 解析(playback_token ∪ session)
     private static final Set<String> PLAYBACK_SYNC_PATHS = Set.of(
-            "/api/playback/event", "/api/playback/events", "/api/playback/changes");
+            "/api/playback/event", "/api/playback/events", "/api/playback/changes", "/api/playback/sync");
+
+    // 装载器资源:清单/爬虫/依赖(/node/{token}/custom/** 与 /node/{token}/lib/**)
+    private static boolean isCustomResourcePath(String uri) {
+        return uri.startsWith("/node/") && (uri.contains("/custom/") || uri.contains("/lib/"));
+    }
+
+    /**
+     * /node/{token}/... 的路径第二段是 vod token:合法(共享 token 或 u- 用户 token)即认可。
+     * checkToken 同时会设置请求级 tenant/currentToken,控制器里会再走一遍,幂等。
+     */
+    private boolean hasValidVodTokenInPath(String uri) {
+        if (subscriptionService == null) {
+            return false;
+        }
+        String[] parts = uri.split("/");
+        if (parts.length < 3 || !"node".equals(parts[1])) {
+            return false;
+        }
+        try {
+            subscriptionService.checkToken(parts[2]);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     private String getToken(HttpServletRequest request) {
         String token = request.getHeader("Authorization");

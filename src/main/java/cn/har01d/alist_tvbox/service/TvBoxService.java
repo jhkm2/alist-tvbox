@@ -169,6 +169,7 @@ public class TvBoxService {
             new FilterValue("低分", "low")
     );
     private final PikPakAccountRepository pikPakAccountRepository;
+    private final AccountAccessGuard accountAccessGuard;
     private List<Site> sites = new ArrayList<>();
     private final OkHttpClient okHttpClient = new OkHttpClient();
 
@@ -194,7 +195,8 @@ public class TvBoxService {
                         ProxyService proxyService,
                         Index115TvBoxAdapter index115Adapter,
                         RestTemplateBuilder builder,
-                        PikPakAccountRepository pikPakAccountRepository) {
+                        PikPakAccountRepository pikPakAccountRepository,
+                        AccountAccessGuard accountAccessGuard) {
         this.accountRepository = accountRepository;
         this.aliasRepository = aliasRepository;
         this.shareRepository = shareRepository;
@@ -218,6 +220,33 @@ public class TvBoxService {
         this.index115Adapter = index115Adapter;
         this.restTemplate = builder.build();
         this.pikPakAccountRepository = pikPakAccountRepository;
+        this.accountAccessGuard = accountAccessGuard;
+    }
+
+    /**
+     * 当前请求方的凭证视角:0=管理级(共享 token=管理员设备/管理会话/X-API-KEY,凭证可全量下发);
+     * >0=具体用户 uid(u- token 须带密钥验真,或 USER 会话),只有 ownerUid 匹配的账号凭证才可随直链下发;
+     * -1=裸 u-{username}(无熵可猜测)——既不发本人凭证,也绝不回落会话(无会话时 currentUid()=0 会被当管理级)。
+     */
+    private int credentialUid() {
+        String token = subscriptionService.getCurrentToken();
+        int uid = subscriptionService.verifiedCredentialUidFor(token);
+        if (uid >= 0) {
+            return uid;
+        }
+        if (token.startsWith(Constants.USER_TOKEN_PREFIX)) {
+            return -1;
+        }
+        // 无 vod token 上下文(网页会话等):回落会话身份,管理级=0
+        return accountAccessGuard.isElevated() ? 0 : accountAccessGuard.currentUid();
+    }
+
+    private boolean canSendCredentials(DriverAccount account) {
+        if (account == null) {
+            return true;
+        }
+        int uid = credentialUid();
+        return uid == 0 || account.getOwnerUid() == uid;
     }
 
     private Site getXiaoyaSite() {
@@ -1081,7 +1110,14 @@ public class TvBoxService {
             return result;
         }
 
-        FsResponse fsResponse = aListService.listFiles(site, path, page, size);
+        FsResponse fsResponse;
+        try {
+            fsResponse = aListService.listFiles(site, path, page, size);
+        } catch (Exception e) {
+            // 目录级失效(订阅主源分享被取消等)不应炸整个浏览接口:降级空列表,巡检下轮自会换源
+            log.warn("list {} failed, degrade to empty: {}", path, e.getMessage());
+            return result;
+        }
         int total = fsResponse.getTotal();
 
         for (FsInfo fsInfo : fsResponse.getFiles()) {
@@ -1445,8 +1481,8 @@ public class TvBoxService {
         url = fixHttp(fsDetail.getRawUrl());
         if ("com.fongmi.android.tv".equals(client)) {
             // ignore
-        } else if ((fsDetail.getProvider().contains("Aliyundrive") && !fsDetail.getRawUrl().contains("115cdn.net"))
-                || (("open".equals(client) || "node".equals(client)) && fsDetail.getProvider().contains("115"))) {
+        } else if (("open".equals(client) || "node".equals(client)) && fsDetail.getProvider().contains("115")) {
+            // 阿里直链带签名可直连(省服务器带宽);仅 open/node 客户端的 115 保留代理(UA 签名校验问题)
             url = buildProxyUrl(site, name, path);
             useProxy = true;
             log.info("play url: {}", url);
@@ -1488,8 +1524,13 @@ public class TvBoxService {
                 result.put("header", Map.of("User-Agent", Constants.QUARK_USER_AGENT, "Referer", cleanUrl + "\\ "));
             } else {
                 var account = getDriverAccount(url, driverType);
-                String cookie = account == null ? "" : account.getCookie();
-                result.put("header", Map.of("Cookie", cookie, "User-Agent", Constants.QUARK_USER_AGENT, "Referer", "https://pan.quark.cn"));
+                if (account != null && !canSendCredentials(account)) {
+                    // 非归属人不得下发 Cookie(凭证只给归属人):改走服务端代理
+                    result.put("url", buildProxyUrl(site, name, path));
+                } else {
+                    String cookie = account == null ? "" : account.getCookie();
+                    result.put("header", Map.of("Cookie", cookie, "User-Agent", Constants.QUARK_USER_AGENT, "Referer", "https://pan.quark.cn"));
+                }
             }
         } else if (driverType == DriverType.UC) {
             int marker = url.indexOf("#x-referer=raw");
@@ -1502,8 +1543,13 @@ public class TvBoxService {
                 result.put("header", Map.of("User-Agent", Constants.UC_USER_AGENT, "Referer", cleanUrl + "\\ "));
             } else {
                 var account = getDriverAccount(url, driverType);
-                String cookie = account == null ? "" : account.getCookie();
-                result.put("header", Map.of("Cookie", cookie, "User-Agent", Constants.UC_USER_AGENT, "Referer", "https://drive.uc.cn"));
+                if (account != null && !canSendCredentials(account)) {
+                    // 非归属人不得下发 Cookie(凭证只给归属人):改走服务端代理
+                    result.put("url", buildProxyUrl(site, name, path));
+                } else {
+                    String cookie = account == null ? "" : account.getCookie();
+                    result.put("header", Map.of("Cookie", cookie, "User-Agent", Constants.UC_USER_AGENT, "Referer", "https://drive.uc.cn"));
+                }
             }
         } else if (driverType == DriverType.THUNDER) {
             result.put("header", Map.of("User-Agent", "AndroidDownloadManager/13 (Linux; U; Android 13; M2004J7AC Build/SP1A.210812.016)"));
@@ -1522,7 +1568,8 @@ public class TvBoxService {
 
         // PowerList 多账号分片:把各账号直连 + 各自 header 设到 result.multiUrls,
         // 供 spider.jar(VideoStreamProxy)客户端多账号分片加速。不改变服务端代理(useProxy)逻辑。
-        if (fsDetail.getMultiSource() != null && !fsDetail.getMultiSource().isEmpty()) {
+        // 分片源 header 含各账号 Cookie,只对管理级凭证视角(共享 token/管理会话)下发;普通用户走单 url(归属人 Cookie 或代理)
+        if (credentialUid() == 0 && fsDetail.getMultiSource() != null && !fsDetail.getMultiSource().isEmpty()) {
             List<Map<String, Object>> multiUrls = new ArrayList<>();
             for (FsDetail.MultiSource ms : fsDetail.getMultiSource()) {
                 Map<String, Object> item = new HashMap<>();
@@ -1700,7 +1747,15 @@ public class TvBoxService {
         return best;
     }
 
-    public Subtitle getSubtitle(Site site, String path, String name) {
+    /** 播放条目用的字幕装配:元数据走 buildSubtitleMeta,URL 走服务端代理(构建零上游直链、不过期)。 */
+    private Subtitle buildSubtitleOption(Site site, String path, String best) {
+        Subtitle subtitle = buildSubtitleMeta(best);
+        subtitle.setUrl(buildProxyUrl(site, best, path));
+        return subtitle;
+    }
+
+    /** 在 path 目录内为 name 挑最佳同名外挂字幕文件;只读目录列表,返回文件名或 null。 */
+    public String findSubtitleName(Site site, String path, String name) {
         FsResponse fsResponse = aListService.listFiles(site, path, 1, 100);
         List<FsInfo> files = fsResponse.getFiles();
         List<String> names = files.stream().map(FsInfo::getName).filter(this::isMediaFile).collect(Collectors.toList());
@@ -1708,8 +1763,37 @@ public class TvBoxService {
         String suffix = Utils.getCommonSuffix(names, false);
         log.debug("{} {}", prefix, suffix);
         List<String> subtitles = files.stream().map(FsInfo::getName).filter(this::isSubtitleFormat).collect(Collectors.toList());
+        return findBestSubtitle(subtitles, name.replace(prefix, "").replace(suffix, ""));
+    }
 
-        String best = findBestSubtitle(subtitles, name.replace(prefix, "").replace(suffix, ""));
+    /** 字幕元数据(lang/name/format/ext)按文件名推断,与 getSubtitle 历史口径一致。 */
+    private Subtitle buildSubtitleMeta(String best) {
+        Subtitle subtitle = new Subtitle();
+        if (best.contains("chs")) {
+            subtitle.setLang("chs");
+            subtitle.setName("简体中文");
+        } else if (best.contains("cht")) {
+            subtitle.setLang("cht");
+            subtitle.setName("繁体中文");
+        } else if (best.contains("en")) {
+            subtitle.setLang("eng");
+            subtitle.setName("英文");
+        }
+        if (best.endsWith("ssa") || best.endsWith("ass")) {
+            // ExoPlayer 按声明的 mime 选字幕解析器:ass 误标 application/x-subrip 会被
+            // SubRipDecoder 解析失败,表现为可选轨但无字幕渲染(与播放端 TrackUtil 映射对齐)
+            subtitle.setFormat("text/x-ssa");
+        } else if (best.endsWith("vtt")) {
+            subtitle.setFormat("text/vtt");
+        } else if (best.endsWith("ttml")) {
+            subtitle.setFormat("application/ttml+xml");
+        }
+        subtitle.setExt(getExt(best));
+        return subtitle;
+    }
+
+    public Subtitle getSubtitle(Site site, String path, String name) {
+        String best = findSubtitleName(site, path, name);
         if (best == null) {
             return null;
         }
@@ -1717,25 +1801,7 @@ public class TvBoxService {
         FsDetail fsDetail = aListService.getFile(site, path + "/" + best);
         log.debug("FsDetail: {}", fsDetail);
         if (fsDetail != null) {
-            Subtitle subtitle = new Subtitle();
-            if (best.contains("chs")) {
-                subtitle.setLang("chs");
-                subtitle.setName("简体中文");
-            } else if (best.contains("cht")) {
-                subtitle.setLang("cht");
-                subtitle.setName("繁体中文");
-            } else if (best.contains("en")) {
-                subtitle.setLang("eng");
-                subtitle.setName("英文");
-            }
-            if (best.endsWith("ssa")) {
-                subtitle.setFormat("text/x-ssa");
-            } else if (best.endsWith("vtt")) {
-                subtitle.setFormat("text/vtt");
-            } else if (best.endsWith("ttml")) {
-                subtitle.setFormat("application/ttml+xml");
-            }
-            subtitle.setExt(getExt(best));
+            Subtitle subtitle = buildSubtitleMeta(best);
             subtitle.setUrl(fixHttp(fsDetail.getRawUrl()));
             log.debug("subtitle: {}", subtitle);
             return subtitle;
@@ -1791,6 +1857,16 @@ public class TvBoxService {
     }
 
     public MovieList getDetail(String ac, String tid, String title, String keyword, Integer depth) {
+        return doGetDetail(ac, tid, title, keyword, depth, false);
+    }
+
+    /** skipMetadata=true:调用方自带元数据(追剧订阅),跳过按名/路径的豆瓣/TMDB 匹配,只装配播放列表。 */
+    public MovieList getDetail(String ac, String tid, String title, String keyword, Integer depth, boolean skipMetadata) {
+        return doGetDetail(ac, tid, title, keyword, depth, skipMetadata);
+    }
+
+    /** 核心实现为 private:重载间委托不经 Mockito spy 代理(严格打桩会把未桩的同名重载自调用判为参数不匹配)。 */
+    private MovieList doGetDetail(String ac, String tid, String title, String keyword, Integer depth, boolean skipMetadata) {
         if (tid.startsWith("http://") || tid.startsWith("https://")) {
             // 网盘分享链接(TVBox 历史记录 / 多端播放同步回放):挂载后建播放列表,
             // 由记录里的 episode 索引驱动续播。同 ParseService.drive / RemoteSearchService.detail。
@@ -1844,7 +1920,7 @@ public class TvBoxService {
         }
         updateShareTime(path);
         if (path.contains(PLAYLIST)) {
-            return getPlaylist(ac, site, path, title, keyword, depth);
+            return getPlaylist(ac, site, path, title, keyword, depth, skipMetadata);
         }
 
         MovieList result = new MovieList();
@@ -1912,6 +1988,18 @@ public class TvBoxService {
                 video.setPath(path);
                 String url = buildProxyUrl(site, path, video);
                 video.setUrl(url);
+                if (isMediaFile(path) && ("web".equals(ac) || "gui".equals(ac))) {
+                    // 桌面客户端(gui)/网页(web)只拿到代理播放 URL,拿不到 /play 里的 subt/subs:
+                    // 这里把同目录最佳外挂字幕一并下发(代理 URL,与 /play getSub=true 同一套挑选逻辑)。
+                    try {
+                        String best = findSubtitleName(site, getParent(path), fsDetail.getName());
+                        if (best != null) {
+                            video.setSubs(List.of(buildSubtitleOption(site, fixPath(getParent(path) + "/" + best), best)));
+                        }
+                    } catch (Exception e) {
+                        log.debug("get subtitle failed: {}", path, e);
+                    }
+                }
                 movieDetail.getItems().add(video);
                 movieDetail.setVod_play_url(url);
                 movieDetail.setType(fsDetail.getType());
@@ -2038,6 +2126,10 @@ public class TvBoxService {
     }
 
     public MovieList getPlaylist(String ac, Site site, String path, String title, String keyword, Integer depth) {
+        return getPlaylist(ac, site, path, title, keyword, depth, false);
+    }
+
+    public MovieList getPlaylist(String ac, Site site, String path, String title, String keyword, Integer depth, boolean skipMetadata) {
         log.info("load playlist {}:{} {}", site.getId(), site.getName(), path);
         String newPath = getParent(path);
         if (!tenantService.valid(newPath)) {
@@ -2093,21 +2185,29 @@ public class TvBoxService {
         }
 
         boolean matched = false;
-        if (StringUtils.isNotBlank(title)) {
-            movieDetail.setVod_name(title);
-            matched = setMovieInfo(site, movieDetail, title, newPath, true);
-        }
-        if (!matched && StringUtils.isNotBlank(keyword)
-                && !StringUtils.equalsIgnoreCase(StringUtils.trim(title), StringUtils.trim(keyword))) {
-            movieDetail.setVod_name(keyword);
-            matched = setMovieInfo(site, movieDetail, keyword, newPath, true);
-        }
-        if (!matched) {
-            movieDetail.setVod_name(fsDetail.getName());
-            matched = setMovieInfo(site, movieDetail, fsDetail.getName(), newPath, true);
-        }
-        if (!matched && (StringUtils.isNotBlank(title) || StringUtils.isNotBlank(keyword))) {
-            movieDetail.setVod_name(preferredName);
+        if (skipMetadata) {
+            // 追剧订阅等自带元数据的调用方:挂载路径名常带资源后缀(如 [dbid-xxx]-补1),
+            // 按名匹配豆瓣/TMDB 既慢又易错,直接跳过;名称/封面/状态由调用方用订阅数据覆写
+            if (StringUtils.isNotBlank(title)) {
+                movieDetail.setVod_name(title);
+            }
+        } else {
+            if (StringUtils.isNotBlank(title)) {
+                movieDetail.setVod_name(title);
+                matched = setMovieInfo(site, movieDetail, title, newPath, true);
+            }
+            if (!matched && StringUtils.isNotBlank(keyword)
+                    && !StringUtils.equalsIgnoreCase(StringUtils.trim(title), StringUtils.trim(keyword))) {
+                movieDetail.setVod_name(keyword);
+                matched = setMovieInfo(site, movieDetail, keyword, newPath, true);
+            }
+            if (!matched) {
+                movieDetail.setVod_name(fsDetail.getName());
+                matched = setMovieInfo(site, movieDetail, fsDetail.getName(), newPath, true);
+            }
+            if (!matched && (StringUtils.isNotBlank(title) || StringUtils.isNotBlank(keyword))) {
+                movieDetail.setVod_name(preferredName);
+            }
         }
 
         FilesList filesList = dfs(site, newPath, ac, "", depth);
@@ -2150,6 +2250,9 @@ public class TvBoxService {
         }
         if (depth > 1) {
             folders.addAll(fsResponse.getFiles().stream().filter(e -> e.getType() == 1).map(FsInfo::getName).toList());
+            // 版本文件夹(HQ.DV/SDR 双压包的两个 Season 目录)按画质兼容性排序:DV/HDR 标记组靠后,
+            // 组序先到先得的消费方(追剧合并 putIfAbsent/分盘线路)自然取到非 DV 版,防杜比视界 P5 绿屏
+            folders.sort(Comparator.comparingInt(TextUtils::picturePenalty));
         }
         log.info("load media files from folders: {}", folders);
         int source = 0;
@@ -2162,7 +2265,7 @@ public class TvBoxService {
                             .filter(e -> e.getType() != 1)
                             .filter(e -> isMediaFormat(e.getName()))
                             .toList();
-                    subfolders = fsResponse.getFiles().stream().filter(e -> e.getType() == 1).map(FsInfo::getName).toList();
+                    subfolders = new ArrayList<>(fsResponse.getFiles().stream().filter(e -> e.getType() == 1).map(FsInfo::getName).toList());
                 }
                 Map<String, FsInfo> map = new HashMap<>();
                 for (var file : files) {
@@ -2172,6 +2275,11 @@ public class TvBoxService {
                 String prefix = Utils.getCommonPrefix(fileNames);
                 String suffix = Utils.getCommonSuffix(fileNames);
                 log.debug("files common prefix: '{}'  common suffix: '{}'", prefix, suffix);
+                // 桌面客户端(gui)/网页(web)的播放列表条目附带同目录字幕(代理 URL):
+                // 构建时零上游直链生成、链接不过期,客户端下载时经 302 取新直链。
+                List<String> subtitleNames = ("web".equals(ac) || "gui".equals(ac))
+                        ? fsResponse.getFiles().stream().map(FsInfo::getName).filter(this::isSubtitleFormat).toList()
+                        : List.of();
 
                 if (appProperties.isSort()) {
                     sort(fileNames);
@@ -2196,6 +2304,12 @@ public class TvBoxService {
                         item.setSize(map.get(name).getSize());
                         String url = buildProxyUrl(site, filepath, item);
                         item.setUrl(url);
+                        if (!subtitleNames.isEmpty()) {
+                            String best = findBestSubtitle(subtitleNames, name.replace(prefix, "").replace(suffix, ""));
+                            if (best != null) {
+                                item.setSubs(List.of(buildSubtitleOption(site, fixPath(path + "/" + folder + "/" + best), best)));
+                            }
+                        }
                         if ("detail".equals(ac)) {
                             urls.add(title + "$" + url);
                         } else {
@@ -2213,6 +2327,8 @@ public class TvBoxService {
                     result.getFolders().add(fixSourceName(parent + "/" + folder));
                 }
 
+                // 同 folders:嵌套版本目录(HQ.DV/SDR)兼容性差的靠后
+                subfolders.sort(Comparator.comparingInt(TextUtils::picturePenalty));
                 for (String name : subfolders) {
                     try {
                         var sub = dfs(site, path + "/" + folder + "/" + name, ac, folder + "/" + name, depth - 1);

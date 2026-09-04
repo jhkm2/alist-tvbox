@@ -7,11 +7,11 @@
           <el-option v-for="item in tokens" :key="item" :label="item" :value="item"/>
         </el-select>
         <el-button @click="load">刷新</el-button>
-        <el-button @click="showGlobalConfig">全局配置</el-button>
-        <el-button @click="showPlugins">订阅源管理</el-button>
-        <el-button @click="showPluginFilters">过滤器管理</el-button>
-        <el-button @click="showScan">同步影视</el-button>
-        <el-button @click="showPush" v-if="devices.length">推送配置</el-button>
+        <el-button v-if="store.admin" @click="showGlobalConfig">全局配置</el-button>
+        <el-button v-if="store.admin" @click="showPlugins">订阅源管理</el-button>
+        <el-button v-if="store.admin" @click="showPluginFilters">过滤器管理</el-button>
+        <el-button v-if="store.admin" @click="showScan">同步影视</el-button>
+        <el-button @click="showPush" v-if="store.admin && devices.length">推送配置</el-button>
         <el-button type="primary" @click="handleAdd">添加</el-button>
       </div>
     </div>
@@ -22,6 +22,13 @@
       <!--      <el-table-column prop="id" label="ID" sortable width="70"/>-->
       <el-table-column prop="sid" label="订阅ID" sortable width="180"/>
       <el-table-column prop="name" label="名称" sortable width="180"/>
+      <el-table-column label="归属" width="90">
+        <template #default="scope">
+          <el-tag :type="scope.row.ownerUid === 0 ? 'info' : 'success'" size="small">
+            {{ scope.row.ownerUid === 0 ? (store.admin ? '全局' : '默认') : '我的' }}
+          </el-tag>
+        </template>
+      </el-table-column>
       <el-table-column prop="url" label="原始配置URL" sortable>
         <template #default="scope">
           <a :href="scope.row.url" target="_blank">{{ scope.row.url }}</a>
@@ -43,13 +50,13 @@
       </el-table-column>
       <el-table-column fixed="right" label="操作" width="200">
         <template #default="scope">
-          <el-button link type="primary" size="small" @click="handleEdit(scope.row)" v-if="scope.row.id">
+          <el-button link type="primary" size="small" @click="handleEdit(scope.row)" v-if="scope.row.id && canManage(scope.row)">
             编辑
           </el-button>
           <el-button link type="primary" size="small" @click="showDetails(scope.row)">
             数据
           </el-button>
-          <el-button link type="danger" size="small" @click="handleDelete(scope.row)" v-if="scope.row.id">
+          <el-button link type="danger" size="small" @click="handleDelete(scope.row)" v-if="scope.row.id && canManage(scope.row)">
             删除
           </el-button>
         </template>
@@ -58,14 +65,10 @@
     </div>
 
     <el-row>
-      猫影视配置接口：
-      <a :href="openUrl" target="_blank">{{ openUrl }}</a>
-      <el-button size="small" style="margin-left: 8px" @click="copyUrl(openUrl)">复制</el-button>
-    </el-row>
-    <el-row>
       猫影视node配置接口：
       <a :href="nodeUrl" target="_blank">{{ nodeUrl2 }}</a>
       <el-button size="small" style="margin-left: 8px" @click="copyUrl(nodeUrl2)">复制</el-button>
+      <router-link to="/files" style="margin-left: 8px">管理猫源文件 →</router-link>
     </el-row>
     <el-row>
       PG包本地： {{ pgLocal }}
@@ -74,8 +77,10 @@
       <span class="hint"></span>
       <span v-if="pgLocal==pgRemote"><el-icon color="green"><Check/></el-icon></span>
       <span v-else><el-icon color="orange"><Warning/></el-icon></span>
-      <span class="hint">自动更新：</span>
-      <el-switch v-model="autoUpdatePg" @change="saveAutoUpdate('auto_update_pg', autoUpdatePg)"/>
+      <template v-if="store.admin">
+        <span class="hint">自动更新：</span>
+        <el-switch v-model="autoUpdatePg" @change="saveAutoUpdate('auto_update_pg', autoUpdatePg)"/>
+      </template>
     </el-row>
 <!--    <el-row>-->
 <!--      真心全量包本地： {{ zxLocal2 }}-->
@@ -91,8 +96,10 @@
       <span class="hint"></span>
       <span v-if="zxLocal==zxRemote"><el-icon color="green"><Check/></el-icon></span>
       <span v-else><el-icon color="orange"><Warning/></el-icon></span>
-      <span class="hint">自动更新：</span>
-      <el-switch v-model="autoUpdateZx" @change="saveAutoUpdate('auto_update_zx', autoUpdateZx)"/>
+      <template v-if="store.admin">
+        <span class="hint">自动更新：</span>
+        <el-switch v-model="autoUpdateZx" @change="saveAutoUpdate('auto_update_zx', autoUpdateZx)"/>
+      </template>
     </el-row>
     <el-row>
       潇洒包本地： {{ xsLocal }}
@@ -101,10 +108,12 @@
       <span class="hint"></span>
       <span v-if="xsLocal==xsRemote"><el-icon color="green"><Check/></el-icon></span>
       <span v-else><el-icon color="orange"><Warning/></el-icon></span>
-      <span class="hint">自动更新：</span>
-      <el-switch v-model="autoUpdateXs" @change="saveAutoUpdate('auto_update_xs', autoUpdateXs)"/>
+      <template v-if="store.admin">
+        <span class="hint">自动更新：</span>
+        <el-switch v-model="autoUpdateXs" @change="saveAutoUpdate('auto_update_xs', autoUpdateXs)"/>
+      </template>
     </el-row>
-    <el-row>
+    <el-row v-if="store.admin">
       <el-button @click="syncCat">同步文件</el-button>
     </el-row>
     </div>
@@ -910,7 +919,7 @@
           </el-select>
         </span>
         <span v-else />
-        <el-link type="info" href="https://github.com/FongMi/TV/blob/release/docs/CONFIG.md" target="_blank" :underline="false">
+        <el-link type="info" href="https://github.com/FongMi/TV/blob/fongmi/docs/CONFIG.md" target="_blank" :underline="false">
           配置文档 <el-icon><Link /></el-icon>
         </el-link>
       </div>
@@ -1001,6 +1010,11 @@ import api from "@/utils/api"
 import {ElMessage} from "element-plus";
 import {Link, ArrowRight} from "@element-plus/icons-vue";
 import Sortable from "sortablejs";
+import {store} from "@/services/store";
+
+// 多用户归属:全局默认订阅(ownerUid=0)所有用户可用,普通用户只读;个人订阅可增删改(后端 AccountAccessGuard 兜底)
+const canManage = (row: any) => store.admin || row.ownerUid !== 0
+
 import type {Device} from "@/model/Device";
 import PluginFilterConfigFieldEditor from "@/components/PluginFilterConfigFieldEditor.vue";
 import QqMusicQrLoginDialog from "@/components/QqMusicQrLoginDialog.vue";
@@ -1126,7 +1140,6 @@ function withBasicAuth(base: string) {
   const prefix = basicAuthUser.value + ':' + basicAuthPass.value + '@'
   return base.replace('http://', 'http://' + prefix).replace('https://', 'https://' + prefix)
 }
-const openUrl = computed(() => withBasicAuth(currentUrl) + '/open' + token.value)
 const nodeUrl = computed(() => withBasicAuth(currentUrl) + '/node' + (token.value ? token.value : '/-') + '/index.config.js')
 const nodeUrl2 = computed(() => withBasicAuth(currentUrl) + '/node' + (token.value ? token.value : '/-') + '/index.js.md5')
 
@@ -3257,7 +3270,10 @@ onMounted(() => {
       tgPhase.value = data.value
     })
   })
-  loadDevices()
+  if (store.admin) {
+    loadDevices()
+  }
+  // 猫影视客户端要求链接内嵌 basic auth:USER 也要加载凭证拼装链接(后端已放开只读)
   axios.get('/api/basic-auth-credentials').then(({data}) => {
     basicAuthUser.value = data.username
     basicAuthPass.value = data.password

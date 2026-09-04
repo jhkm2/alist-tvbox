@@ -1,22 +1,34 @@
 <template>
   <div :class="embedded ? '' : 'page-container'">
     <div class="page-header" v-if="!embedded">
-      <h1 class="page-title">网盘账号列表</h1>
+      <div style="display: flex; align-items: center; gap: 16px">
+        <el-select v-model="typeFilter" size="small" style="width: 140px" placeholder="全部类型">
+          <el-option label="全部类型" value=""/>
+          <el-option v-for="type in accountTypes" :key="type" :label="typeLabel(type)" :value="type"/>
+        </el-select>
+        <h1 class="page-title">网盘账号列表</h1>
+      </div>
       <div class="page-actions">
         <el-button @click="load">刷新</el-button>
-        <el-button @click="openConfig">配置</el-button>
+        <el-button v-if="store.admin" @click="openConfig">配置</el-button>
         <el-button type="primary" @click="handleAdd">添加</el-button>
       </div>
     </div>
-    <div v-else class="page-actions" style="margin-bottom: 16px; display: flex; justify-content: flex-end; gap: 12px;">
-      <el-button @click="load">刷新</el-button>
-      <el-button type="primary" @click="openConfig">配置</el-button>
-      <el-button type="primary" @click="handleAdd">添加</el-button>
+    <div v-else style="margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+      <el-select v-model="typeFilter" size="small" style="width: 140px" placeholder="全部类型">
+        <el-option label="全部类型" value=""/>
+        <el-option v-for="type in accountTypes" :key="type" :label="typeLabel(type)" :value="type"/>
+      </el-select>
+      <div style="display: flex; gap: 12px;">
+        <el-button @click="load">刷新</el-button>
+        <el-button v-if="store.admin" type="primary" @click="openConfig">配置</el-button>
+        <el-button type="primary" @click="handleAdd">添加</el-button>
+      </div>
     </div>
 
     <div class="page-card">
     <div class="table-scroll-wrapper">
-    <el-table :data="accounts" border style="width: 100%; min-width: 1200px">
+    <el-table :data="filteredAccounts" border style="width: 100%; min-width: 1200px">
       <el-table-column prop="id" label="ID" sortable width="70">
         <template #default="scope">
           {{ scope.row.id + 4000 }}
@@ -24,22 +36,17 @@
       </el-table-column>
       <el-table-column prop="type" label="类型" sortable width="150">
         <template #default="scope">
-          <span v-if="scope.row.type=='QUARK'">夸克网盘</span>
-          <span v-else-if="scope.row.type=='UC'">UC网盘</span>
-          <span v-else-if="scope.row.type=='QUARK_TV'">夸克TV</span>
-          <span v-else-if="scope.row.type=='UC_TV'">UC TV</span>
-          <span v-else-if="scope.row.type=='PAN115'">115云盘</span>
-          <span v-else-if="scope.row.type=='OPEN115'">115 Open(移除)</span>
-          <span v-else-if="scope.row.type=='THUNDER'">迅雷云盘</span>
-          <span v-else-if="scope.row.type=='CLOUD189'">天翼云盘</span>
-          <span v-else-if="scope.row.type=='PAN139'">移动云盘</span>
-          <span v-else-if="scope.row.type=='PAN123'">123网盘</span>
-          <span v-else-if="scope.row.type=='OPEN123'">123 Open</span>
-          <span v-else-if="scope.row.type=='BAIDU'">百度网盘</span>
-          <span v-else-if="scope.row.type=='GUANGYA'">光鸭云盘</span>
+          {{ typeLabel(scope.row.type) }}
         </template>
       </el-table-column>
       <el-table-column prop="name" label="名称" sortable width="200"/>
+      <el-table-column label="归属" width="90">
+        <template #default="scope">
+          <el-tag :type="scope.row.ownerUid === 0 ? 'info' : 'success'" size="small">
+            {{ scope.row.ownerUid === 0 ? (store.admin ? '全局' : '共享') : '我的' }}
+          </el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="路径">
         <template #default="scope">
           <router-link :to="'/vod' + fullPath(scope.row)">
@@ -70,8 +77,8 @@
       <el-table-column fixed="right" label="操作" width="270">
         <template #default="scope">
           <el-button link type="primary" size="small" @click="showAccountInfo(scope.row)">账号信息</el-button>
-          <el-button link type="primary" size="small" @click="handleEdit(scope.row)">编辑</el-button>
-          <el-button link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
+          <el-button v-if="canManage(scope.row)" link type="primary" size="small" @click="handleEdit(scope.row)">编辑</el-button>
+          <el-button v-if="canManage(scope.row)" link type="danger" size="small" @click="handleDelete(scope.row)">删除</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -173,6 +180,8 @@
         </el-form-item>
         <el-form-item label="密码" v-if="form.type=='THUNDER'||form.type=='CLOUD189'||form.type=='PAN123'" required>
           <el-input type="password" show-password v-model="form.password"/>
+          <a href="https://yun.123pan.cn/" target="_blank" v-if="form.type=='PAN123'">123云盘</a>
+          <a href="https://pan.xunlei.com/" target="_blank" v-if="form.type=='THUNDER'">迅雷云盘</a>
         </el-form-item>
         <el-form-item label="验证码" v-if="form.type=='THUNDER'||form.type=='CLOUD189'">
           <el-input v-model="form.token"/>
@@ -239,6 +248,15 @@
             active-text="是"
             inactive-text="否"
           />
+        </el-form-item>
+        <el-form-item label="共享给普通用户" v-if="store.admin && !form.ownerUid">
+          <el-switch
+            v-model="form.shared"
+            inline-prompt
+            active-text="开启"
+            inactive-text="关闭"
+          />
+          <span class="hint">允许普通用户经服务端代理使用该账号,凭证不会下发给普通用户</span>
         </el-form-item>
         <span style="margin-left: 72px" v-if="form.name">完整路径： {{ fullPath(form) }}</span>
       </el-form>
@@ -484,6 +502,10 @@ import {Check, Close} from '@element-plus/icons-vue'
 import axios from "axios"
 import {ElMessage} from "element-plus";
 import clipBorad from "vue-clipboard3";
+import {store} from '@/services/store'
+
+// 多用户归属:全局账号(ownerUid=0)仅管理员可编辑;普通用户只能管理自己的账号(后端 AccountAccessGuard 兜底)
+const canManage = (row: any) => store.admin || row.ownerUid !== 0
 
 let {toClipboard} = clipBorad();
 
@@ -540,6 +562,36 @@ type AccountInfoAdditionItem = {
 const updateAction = ref(false)
 const dialogTitle = ref('')
 const accounts = ref<DriverAccountItem[]>([])
+// 类型筛选:选项从现有账号动态收集(只列实际存在的盘类型),label 映射与类型列同源
+const typeLabels: Record<string, string> = {
+  BAIDU: '百度网盘',
+  QUARK: '夸克网盘',
+  UC: 'UC网盘',
+  PAN115: '115云盘',
+  PAN123: '123网盘',
+  THUNDER: '迅雷云盘',
+  GUANGYA: '光鸭云盘',
+  CLOUD189: '天翼云盘',
+  PAN139: '移动云盘',
+  OPEN123: '123 Open',
+  QUARK_TV: '夸克TV',
+  UC_TV: 'UC TV',
+}
+const typeLabel = (type: string) => typeLabels[type] || type
+const typeFilter = ref('')
+const filteredAccounts = computed(() =>
+  typeFilter.value ? accounts.value.filter(item => item.type === typeFilter.value) : accounts.value)
+// 选项按 typeLabels 固定顺序输出(不随账号出现顺序漂移),映射外的类型追加在末尾
+const accountTypes = computed(() => {
+  const present = new Set(accounts.value.map(item => item.type))
+  const ordered = Object.keys(typeLabels).filter(type => present.has(type))
+  present.forEach(type => {
+    if (!typeLabels[type]) {
+      ordered.push(type)
+    }
+  })
+  return ordered
+})
 const accountInfo = ref<AccountInfo | null>(null)
 const formVisible = ref(false)
 const dialogVisible = ref(false)
@@ -561,6 +613,8 @@ const driveTypes: Array<{ key: CloudDriveType; label: string }> = [
 const form = ref({
   id: 0,
   type: 'QUARK',
+  shared: true,
+  ownerUid: 0,
   name: '',
   cookie: '',
   token: '',
@@ -733,6 +787,8 @@ const handleAdd = () => {
   form.value = {
     id: 0,
     type: 'QUARK',
+    shared: true,
+    ownerUid: 0,
     name: '',
     cookie: '',
     token: '',

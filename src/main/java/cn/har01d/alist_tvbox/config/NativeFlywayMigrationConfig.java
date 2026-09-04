@@ -13,6 +13,37 @@ import db.migration.current.V16__MigrateLegacyHistory;
 import db.migration.current.V17__FixChangeSequenceWatermark;
 import db.migration.current.V18__PlaybackDrivePath;
 import db.migration.current.V19__LiveFollow;
+import db.migration.current.V20__MediaSubscription;
+import db.migration.current.V21__MediaSubscriptionMeta;
+import db.migration.current.V22__MediaSubscriptionMetaFix;
+import db.migration.current.V23__MediaSubscriptionAccounts;
+import db.migration.current.V24__MediaSubscriptionBrokenEpisodes;
+import db.migration.current.V25__MediaSubscriptionSchedule;
+import db.migration.current.V26__MediaSubscriptionCrossDrive;
+import db.migration.current.V27__MediaSubscriptionAliases;
+import db.migration.current.V28__MediaSubscriptionMainDrives;
+import db.migration.current.V29__MediaSubscriptionMaxEpisode;
+import db.migration.current.V30__MediaSubscriptionEpisodeSource;
+import db.migration.current.V31__MediaSubscriptionCover;
+import db.migration.current.V32__MediaMetadata;
+import db.migration.current.V33__MediaSubscriptionCaughtUp;
+import db.migration.current.V34__MediaSubscriptionResourceLinkHash;
+import db.migration.current.V35__MediaSubscriptionResourcePinned;
+import db.migration.current.V36__MediaSubscriptionNotify;
+import db.migration.current.V37__AccountOwnership;
+import db.migration.current.V38__SubscriptionOwnership;
+import db.migration.current.V39__UserVodSecret;
+import db.migration.current.V40__PlayUrlOwnership;
+import db.migration.current.V41__MediaSubscriptionAirClock;
+import db.migration.current.V42__MediaSubscriptionSeasonStart;
+import db.migration.current.V43__MediaSubscriptionResourceStart;
+import db.migration.current.V44__MediaSubscriptionResourceSeasonStarts;
+import db.migration.current.V45__MovieDiffLog;
+import db.migration.current.V46__MediaSubscriptionManualTotal;
+import db.migration.current.V47__MediaSubscriptionResourceFailKind;
+import db.migration.current.V48__MediaSubscriptionMagnetOffline;
+import db.migration.current.V49__OfflineDownloadTaskMagnetQuota;
+import db.migration.current.V50__MediaSubscriptionCustomKeywords;
 import org.springframework.boot.flyway.autoconfigure.FlywayConfigurationCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -56,7 +87,38 @@ public class NativeFlywayMigrationConfig {
                     new V16__MigrateLegacyHistory(),
                     new V17__FixChangeSequenceWatermark(),
                     new V18__PlaybackDrivePath(),
-                    new V19__LiveFollow());
+                    new V19__LiveFollow(),
+                    new V20__MediaSubscription(),
+                    new V21__MediaSubscriptionMeta(),
+                    new V22__MediaSubscriptionMetaFix(),
+                    new V23__MediaSubscriptionAccounts(),
+                    new V24__MediaSubscriptionBrokenEpisodes(),
+                    new V25__MediaSubscriptionSchedule(),
+                    new V26__MediaSubscriptionCrossDrive(),
+                    new V27__MediaSubscriptionAliases(),
+                    new V28__MediaSubscriptionMainDrives(),
+                    new V29__MediaSubscriptionMaxEpisode(),
+                    new V30__MediaSubscriptionEpisodeSource(),
+                    new V31__MediaSubscriptionCover(),
+                    new V32__MediaMetadata(),
+                    new V33__MediaSubscriptionCaughtUp(),
+                    new V34__MediaSubscriptionResourceLinkHash(),
+                    new V35__MediaSubscriptionResourcePinned(),
+                    new V36__MediaSubscriptionNotify(),
+                    new V37__AccountOwnership(),
+                    new V38__SubscriptionOwnership(),
+                    new V39__UserVodSecret(),
+                    new V40__PlayUrlOwnership(),
+                    new V41__MediaSubscriptionAirClock(),
+                    new V42__MediaSubscriptionSeasonStart(),
+                    new V43__MediaSubscriptionResourceStart(),
+                    new V44__MediaSubscriptionResourceSeasonStarts(),
+                    new V45__MovieDiffLog(),
+                    new V46__MediaSubscriptionManualTotal(),
+                    new V47__MediaSubscriptionResourceFailKind(),
+                    new V48__MediaSubscriptionMagnetOffline(),
+                    new V49__OfflineDownloadTaskMagnetQuota(),
+                    new V50__MediaSubscriptionCustomKeywords());
         };
     }
 }

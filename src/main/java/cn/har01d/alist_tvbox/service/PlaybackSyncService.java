@@ -64,13 +64,14 @@ public class PlaybackSyncService {
     private static final Set<String> TELEGRAM_SITE_KEYS = Set.of(
             "csp_TgDouBan", "csp_TgSearch", "csp_TgWeb", "csp_FishPanSou", "csp_FishPanSouGroup");
     private static final Set<String> BROWSE_SITE_KEYS = Set.of("csp_AList", "csp_XiaoYa");
-    // 网页端可直接播放的站点 key:电报系 + 浏览系 + atv-player(TvBox)/电报频道。供「网页播放」筛选。
+    // 网页端可直接播放的站点 key:电报系 + 浏览系 + 追剧媒体库 + atv-player(TvBox)/电报频道。供「网页播放」筛选。
     private static final Set<String> WEB_PLAYABLE_SITE_KEYS;
     static {
         Set<String> keys = new HashSet<>(TELEGRAM_SITE_KEYS);
         keys.addAll(BROWSE_SITE_KEYS);
         keys.add("TvBox");
         keys.add("csp_TgChannel");
+        keys.add("csp_Media");
         WEB_PLAYABLE_SITE_KEYS = Set.copyOf(keys);
     }
 
@@ -158,10 +159,13 @@ public class PlaybackSyncService {
         List<History> rows = new ArrayList<>(
                 findAllSync(uid, syncScope, Sort.unsorted()));
         rows.sort(Comparator.comparingLong(this::timeOf).reversed());
-        Set<PlaybackIdentity> identities = new HashSet<>();
+        // 去重身份必须带 syncScope:uid 级 trim 覆盖全部分区,同一剧集在不同分区是两条独立记录,
+        // 按 (kind,key,vodId) 去重会把 scoped 分区的行误删
+        Set<TrimIdentity> identities = new HashSet<>();
         List<History> removed = new ArrayList<>();
         for (History row : rows) {
-            if (!identities.add(identityOf(row)) || identities.size() > SYNC_HISTORY_LIMIT) {
+            if (!identities.add(new TrimIdentity(row.getSyncScope(), row.getSourceKind(), row.getSourceKey(), row.getVodId()))
+                    || identities.size() > SYNC_HISTORY_LIMIT) {
                 removed.add(row);
             }
         }
@@ -169,6 +173,9 @@ public class PlaybackSyncService {
             historyRepository.deleteAll(removed);
             log.debug("trimmed playback sync history: uid={} scope={} removed={}", uid, syncScope, removed.size());
         }
+    }
+
+    private record TrimIdentity(String syncScope, String sourceKind, String sourceKey, String vodId) {
     }
 
     private void upsert(int uid, String syncScope, PlaybackSyncInput in, String eventId, String dedupeKey) {
@@ -197,7 +204,7 @@ public class PlaybackSyncService {
 
         long deletedAt = tombstoneWatermark(uid, syncScope, sourceKind, in.getSourceKey(), in.getVodId());
         if (updatedAt <= deletedAt) {
-            log.debug("skip resurrect (tombstone newer): uid={} vodId={}", uid, in.getVodId());
+            log.debug("skip resurrect (tombstone newer): uid={} site={} vodId={}", uid, in.getSiteKey(), in.getVodId());
             return;
         }
 
@@ -207,7 +214,7 @@ public class PlaybackSyncService {
         if (exist != null) {
             long existTime = timeOf(exist);
             if (updatedAt < existTime) {
-                log.debug("skip not newer: uid={} vodId={} remote={} local={}", uid, in.getVodId(), updatedAt, existTime);
+                log.debug("skip not newer: uid={} site={} vodId={} remote={} local={}", uid, in.getSiteKey(), in.getVodId(), updatedAt, existTime);
                 return;
             }
             if (updatedAt == existTime) {
@@ -216,11 +223,11 @@ public class PlaybackSyncService {
                     exist.setSourceName(sourceName);
                     exist.setChangeSeq(changeSeq);
                     historyRepository.save(exist);
-                    log.debug("repaired source name: uid={} vodId={} sourceName={}",
-                            uid, in.getVodId(), sourceName);
+                    log.debug("repaired source name: uid={} site={} vodId={} sourceName={}",
+                            uid, in.getSiteKey(), in.getVodId(), sourceName);
                 } else {
-                    log.debug("skip not newer: uid={} vodId={} remote={} local={}",
-                            uid, in.getVodId(), updatedAt, existTime);
+                    log.debug("skip not newer: uid={} site={} vodId={} remote={} local={}",
+                            uid, in.getSiteKey(), in.getVodId(), updatedAt, existTime);
                 }
                 return;
             }

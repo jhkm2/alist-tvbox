@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -58,8 +59,8 @@ class DoubanServiceTest {
     @BeforeEach
     void setUp() {
         doubanService = new DoubanService(appProperties, metaRepository, movieRepository, aliasRepository,
-                settingRepository, siteService, taskService, fileDownloader, new RestTemplateBuilder(),
-                jdbcTemplate, environment);
+                settingRepository, siteService, taskService, fileDownloader,
+                new RestTemplateBuilder(), jdbcTemplate, environment);
     }
 
     @Test
@@ -113,6 +114,28 @@ class DoubanServiceTest {
         assertThat(DoubanService.getYearFromText("1234")).isNull();
         assertThat(DoubanService.getYearFromText("没有年份的标题")).isNull();
         assertThat(DoubanService.getYearFromText(null)).isNull();
+    }
+
+    @Test
+    void getByNameResolvesDbidTagDirectly() {
+        Movie tagged = movie("一念永恒", 2020);
+        when(movieRepository.findById(37448094)).thenReturn(Optional.of(tagged));
+
+        // 转存目录自带的 [dbid-x] 标记:精确命中,不再走名称匹配
+        assertThat(doubanService.getByName("一念永恒-完结季 [dbid-37448094]")).isSameAs(tagged);
+        verify(movieRepository, never()).getByName(anyString());
+    }
+
+    @Test
+    void getByNameStripsMetaTagWhenIdMissesLocally() {
+        when(movieRepository.findById(37448094)).thenReturn(Optional.empty());
+        when(aliasRepository.findById(anyString())).thenReturn(Optional.empty());
+        Movie movie = movie("一念永恒", 2020);
+        when(movieRepository.getByName(anyString())).thenReturn(List.of(movie));
+
+        // 本地库无该豆瓣 id:剥离标记后按名称匹配,搜索词不再被 dbid 污染
+        assertThat(doubanService.getByName("一念永恒-完结季 [dbid-37448094]", 2020)).isSameAs(movie);
+        verify(movieRepository).getByName(org.mockito.ArgumentMatchers.argThat(n -> n != null && !n.contains("dbid")));
     }
 
     @Test
