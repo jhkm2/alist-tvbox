@@ -4,10 +4,28 @@ import cn.har01d.alist_tvbox.dto.MediaSubscriptionDto;
 import cn.har01d.alist_tvbox.dto.MediaSubscriptionEventDto;
 import cn.har01d.alist_tvbox.dto.MediaSubscriptionRequest;
 import cn.har01d.alist_tvbox.dto.MediaSubscriptionResourceDto;
+import cn.har01d.alist_tvbox.dto.PanLianAccountStatus;
+import cn.har01d.alist_tvbox.dto.PanLianCaptcha;
+import cn.har01d.alist_tvbox.dto.PanLianCaptchaLoginRequest;
+import cn.har01d.alist_tvbox.dto.PanLianCaptchaLoginResult;
+import cn.har01d.alist_tvbox.dto.SiteCredentialCheckRequest;
+import cn.har01d.alist_tvbox.dto.SiteCredentialCheckResult;
+import cn.har01d.alist_tvbox.dto.WanouSiteStatus;
+import cn.har01d.alist_tvbox.service.sitesearch.WanouSearchService;
+import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.service.MediaSubscriptionCheckService;
 import cn.har01d.alist_tvbox.service.MediaSubscriptionService;
 import cn.har01d.alist_tvbox.service.MediaSubscriptionTransferService;
 import cn.har01d.alist_tvbox.service.PianDanService;
+import cn.har01d.alist_tvbox.service.sitesearch.GuanYingSearchService;
+import cn.har01d.alist_tvbox.service.sitesearch.KuafuSearchService;
+import cn.har01d.alist_tvbox.service.sitesearch.Pan123CommunitySearchService;
+import cn.har01d.alist_tvbox.service.sitesearch.PanLianSearchService;
+import cn.har01d.alist_tvbox.service.sitesearch.WoniuSearchService;
+import cn.har01d.alist_tvbox.service.sitesearch.ZhenCangSearchService;
+import cn.har01d.alist_tvbox.service.sitesearch.JyingSearchService;
+import cn.har01d.alist_tvbox.tvbox.MovieDetail;
+import cn.har01d.alist_tvbox.tvbox.MovieList;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -19,6 +37,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -32,15 +51,99 @@ public class MediaSubscriptionController {
     private final MediaSubscriptionCheckService checkService;
     private final MediaSubscriptionTransferService transferService;
     private final PianDanService pianDanService;
+    private final PanLianSearchService panLianSearchService;
+    private final WoniuSearchService woniuSearchService;
+    private final GuanYingSearchService guanYingSearchService;
+    private final ZhenCangSearchService zhenCangSearchService;
+    private final Pan123CommunitySearchService pan123CommunitySearchService;
+    private final KuafuSearchService kuafuSearchService;
+    private final JyingSearchService jyingSearchService;
+    private final WanouSearchService wanouSearchService;
 
     public MediaSubscriptionController(MediaSubscriptionService subscriptionService,
                                        MediaSubscriptionCheckService checkService,
                                        MediaSubscriptionTransferService transferService,
-                                       PianDanService pianDanService) {
+                                       PianDanService pianDanService,
+                                       PanLianSearchService panLianSearchService,
+                                       WoniuSearchService woniuSearchService,
+                                       GuanYingSearchService guanYingSearchService,
+                                       ZhenCangSearchService zhenCangSearchService,
+                                       Pan123CommunitySearchService pan123CommunitySearchService,
+                                       KuafuSearchService kuafuSearchService,
+                                       JyingSearchService jyingSearchService,
+                                       WanouSearchService wanouSearchService) {
         this.subscriptionService = subscriptionService;
         this.checkService = checkService;
         this.transferService = transferService;
         this.pianDanService = pianDanService;
+        this.panLianSearchService = panLianSearchService;
+        this.woniuSearchService = woniuSearchService;
+        this.guanYingSearchService = guanYingSearchService;
+        this.zhenCangSearchService = zhenCangSearchService;
+        this.pan123CommunitySearchService = pan123CommunitySearchService;
+        this.kuafuSearchService = kuafuSearchService;
+        this.jyingSearchService = jyingSearchService;
+        this.wanouSearchService = wanouSearchService;
+    }
+
+    /** 盘链账号池状态:逐号拉站点配额/签到/账号信息(只读,不触发签到);与设置同权限面,仅 ADMIN。 */
+    @GetMapping("/panlian/accounts")
+    public List<PanLianAccountStatus> panlianAccounts() {
+        return panLianSearchService.accountStatuses();
+    }
+
+    /**
+     * 盘链图形验证码(2026-09-26 起站点登录强制):拉取验证码图供人工输码,
+     * 与账号池状态同权限面(ADMIN),image 为 data URI 直接渲染。
+     */
+    @GetMapping("/panlian/captcha")
+    public PanLianCaptcha panlianCaptcha() throws Exception {
+        return panLianSearchService.fetchCaptcha();
+    }
+
+    /** 盘链人工验证码登录:用户输码后带 captcha_id/captcha_code 完成登录并落库会话,仅 ADMIN。 */
+    @PostMapping("/panlian/captcha-login")
+    public PanLianCaptchaLoginResult panlianCaptchaLogin(@RequestBody PanLianCaptchaLoginRequest request) {
+        if (StringUtils.isAnyBlank(request.username(), request.password())) {
+            throw new BadRequestException("请填写账号与密码");
+        }
+        return panLianSearchService.loginWithCaptcha(request.username(), request.password(),
+                request.captchaId(), request.captchaCode());
+    }
+
+    /**
+     * 站点搜索源凭证有效性检查:只读探测登录态(不触发签到/回复),校验表单当前值
+     * (未保存也可先验);观影/蜗牛 Cookie 未填时可用账号密码实测登录(与搜索自动登录
+     * 同链路)。盘链走 /panlian/accounts 真登录态查询,不在此列。
+     */
+    @PostMapping("/site-credentials/check")
+    public SiteCredentialCheckResult checkSiteCredential(@RequestBody SiteCredentialCheckRequest request) {
+        String site = StringUtils.trimToEmpty(request.site());
+        if (StringUtils.isBlank(request.cookie()) && StringUtils.isBlank(request.username())) {
+            throw new BadRequestException("未填写 Cookie 或账号");
+        }
+        return switch (site) {
+            case "woniu" -> woniuSearchService.checkCredential(request);
+            case "guanying" -> guanYingSearchService.checkCredential(request);
+            case "zencang" -> zhenCangSearchService.checkCredential(request);
+            case "pan123community" -> pan123CommunitySearchService.checkCredential(request);
+            case "kuafu" -> kuafuSearchService.checkCredential(request);
+            case "jying" -> jyingSearchService.checkCredential(request);
+            default -> throw new BadRequestException("未知站点:" + site);
+        };
+    }
+
+    /** 玩偶聚合站点域名状态:最近一轮定时探测快照(可达性+延迟,首条即当前采用域名)。 */
+    @GetMapping("/wanou/domains")
+    public List<WanouSiteStatus> wanouDomainStatus() {
+        return wanouSearchService.domainStatusDtos();
+    }
+
+    /** 玩偶聚合站点域名立即探测:并行测全部候选域名并按延迟重排采用顺序,返回最新结果。 */
+    @PostMapping("/wanou/domains/probe")
+    public List<WanouSiteStatus> probeWanouDomains() {
+        wanouSearchService.probeAllDomains();
+        return wanouSearchService.domainStatusDtos();
     }
 
     /** 片单追更:片单导航分类(豆瓣/TMDB 榜单与筛选定义,排除电影类目——追更只对剧集/综艺有意义)。管理端代理,走登录态鉴权,免 vod token。 */
@@ -49,13 +152,101 @@ public class MediaSubscriptionController {
         return pianDanService.subscriptionCategory();
     }
 
-    /** 片单追更:分类条目列表。ac 固定 web(豆瓣封面走 /images 代理防盗链)。 */
+    /** 片单追更:分类条目列表。ac 固定 web(豆瓣封面走 /images 代理防盗链)。
+     *  TMDB 条目封面是 image.tmdb.org 绝对地址(网页直连被墙/防盗链),与 detail 同口径包代理;
+     *  列表对象可能是 pianDanService listCache 里的共享实例 —— 拷贝再改写,防缓存被污染。 */
     @GetMapping("/navigation/list")
     public Object navigationList(String t,
                                  @RequestParam(required = false, defaultValue = "1") int pg,
                                  @RequestParam(required = false, defaultValue = "24") int size,
                                  @RequestParam Map<String, String> filters) {
-        return pianDanService.list(t, "web", pg, size, filters);
+        MovieList result = pianDanService.list(t, "web", pg, size, filters);
+        List<MovieDetail> items = new ArrayList<>();
+        for (MovieDetail item : result.getList()) {
+            MovieDetail copy = copyMovieDetail(item);
+            copy.setVod_pic(subscriptionService.proxiedCover(copy.getVod_pic()));
+            items.add(copy);
+        }
+        result.setList(items);
+        return result;
+    }
+
+    /** 片单追更:条目媒体详情。tmdb:{tv|movie}:{id} 直取 TMDB 元数据;s:{标题}[@{年份}] 本地豆瓣库
+     *  富化(无匹配回落仅标题)。封面统一 /images 代理(与订阅详情抽屉同口径)。 */
+    @GetMapping("/navigation/detail")
+    public Object navigationDetail(@RequestParam String id) {
+        if (id.startsWith(PianDanService.TMDB_PREFIX)) {
+            String[] parts = id.split(":");
+            int tmdbId = -1;
+            if (parts.length >= 3) {
+                try {
+                    tmdbId = Integer.parseInt(parts[2]);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (tmdbId < 0) {
+                throw new BadRequestException("无效的片单条目: " + id);
+            }
+            MovieDetail source = pianDanService.tmdbDetail(parts[1], tmdbId);
+            if (source == null) {
+                throw new BadRequestException("片单条目信息获取失败: " + id);
+            }
+            MovieDetail detail = copyMovieDetail(source);
+            detail.setVod_pic(subscriptionService.proxiedCover(detail.getVod_pic()));
+            return detail;
+        }
+        if (id.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX)) {
+            // db:{豆瓣id}:本地库 id 直取,未收录的榜单新片回落 rexxar 在线解析
+            int doubanId;
+            try {
+                doubanId = Integer.parseInt(id.substring(PianDanService.DOUBAN_SUBJECT_PREFIX.length()));
+            } catch (NumberFormatException e) {
+                throw new BadRequestException("无效的片单条目: " + id);
+            }
+            MovieDetail detail = subscriptionService.localDoubanDetailById(doubanId);
+            if (detail == null) {
+                detail = copyMovieDetail(pianDanService.doubanSubjectDetail(doubanId));
+            }
+            if (detail == null) {
+                throw new BadRequestException("片单条目信息获取失败: " + id);
+            }
+            detail.setVod_id(id);
+            detail.setVod_pic(subscriptionService.proxiedCover(detail.getVod_pic()));
+            return detail;
+        }
+        if (id.startsWith("s:")) {
+            PianDanService.NameYear entry = PianDanService.parseSubjectId(id);
+            MovieDetail detail = subscriptionService.localDoubanDetail(entry.name(), entry.year());
+            if (detail == null) {
+                detail = new MovieDetail();
+                detail.setVod_name(entry.name());
+            }
+            detail.setVod_id(id);
+            detail.setVod_pic(subscriptionService.proxiedCover(detail.getVod_pic()));
+            return detail;
+        }
+        throw new BadRequestException("无效的片单条目: " + id);
+    }
+
+    /** tmdbDetail 命中共享缓存返回同一实例 —— 拷贝再改写,防缓存被污染。 */
+    private static MovieDetail copyMovieDetail(MovieDetail source) {
+        if (source == null) {
+            return null;
+        }
+        MovieDetail copy = new MovieDetail();
+        copy.setVod_id(source.getVod_id());
+        copy.setVod_name(source.getVod_name());
+        copy.setVod_pic(source.getVod_pic());
+        copy.setVod_year(source.getVod_year());
+        copy.setType_name(source.getType_name());
+        copy.setVod_remarks(source.getVod_remarks());
+        copy.setVod_director(source.getVod_director());
+        copy.setVod_actor(source.getVod_actor());
+        copy.setVod_area(source.getVod_area());
+        copy.setVod_lang(source.getVod_lang());
+        copy.setVod_content(source.getVod_content());
+        copy.setExt(source.getExt());
+        return copy;
     }
 
     @GetMapping
@@ -122,12 +313,20 @@ public class MediaSubscriptionController {
     }
 
     /** 手动添加候选资源:粘贴网盘分享链接直接入候选池(不挂载、不动主源),巡检/补缺时自动探测;
-     *  与 activate/pin(转主源)分开,回应"一启用就变主资源"。body {link, password?}。 */
+     *  与 activate/pin(转主源)分开,回应"一启用就变主资源"。body {link, password?};
+     *  link 为本站 URL/裸路径时走路径资源即时入账(issue #1071)。 */
     @PostMapping("/{id}/resources")
     public Map<String, Object> addResource(@PathVariable int id, @RequestBody Map<String, String> body) {
         return subscriptionService.addResource(currentUid(), id,
                 body == null ? null : body.get("link"),
                 body == null ? null : body.get("password"));
+    }
+
+    /** 网盘目录选择器(issue #1071):列出已挂载网盘目录树的一层子目录(path 空=根=已挂载存储),
+     *  供「添加资源-网盘目录」懒加载浏览,选中即以路径资源入账。 */
+    @GetMapping("/drive-dirs")
+    public List<String> driveDirs(@RequestParam(name = "path", required = false) String path) {
+        return checkService.browseDriveDirs(path);
     }
 
     /** 手动磁力补缺:粘贴磁力/ed2k 提交全局离线下载账号,下载完成入账补缺集。body {url, episode?}
@@ -141,6 +340,13 @@ public class MediaSubscriptionController {
         return checkService.submitManualMagnet(currentUid(), id,
                 body == null ? null : String.valueOf(body.get("url")),
                 episode);
+    }
+
+    /** 手动固化一批 115 自有分享(转存可看集 → 建永久分享 → 删源释放空间):同步执行,结果消息回显;
+     *  需订阅开启 115 自有分享 + cookie 版 115 账号(全局总闸只管自动巡检,用户显式动作直通)。 */
+    @PostMapping("/{id}/self-share")
+    public Map<String, Object> selfShare(@PathVariable int id) {
+        return Map.of("message", checkService.selfShareNow(currentUid(), id));
     }
 
     /** 手动磁力搜索:按关键词(空=订阅关键词)+可选集号搜磁力/ed2k 候选(与自动兜底同源),

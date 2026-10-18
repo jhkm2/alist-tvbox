@@ -1,5 +1,6 @@
 package cn.har01d.alist_tvbox.live.service;
 
+import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.tvbox.Category;
 import cn.har01d.alist_tvbox.tvbox.CategoryList;
 import cn.har01d.alist_tvbox.tvbox.MovieDetail;
@@ -69,6 +70,11 @@ public class TwitchService implements LivePlatform {
     @Override
     public String getType() {
         return "twitch";
+    }
+    /** 清单域名对浏览器 Origin/Referer 403,网页端经直播代理中转。 */
+    @Override
+    public boolean isProxied() {
+        return true;
     }
 
     @Override
@@ -197,7 +203,11 @@ public class TwitchService implements LivePlatform {
             return cached;
         }
 
-        String login = tid.split("\\$")[1];
+        String[] parts = tid.split("\\$");
+        if (parts.length < 2) {
+            throw new BadRequestException("无效的直播间ID: " + tid);
+        }
+        String login = parts[1];
         MovieList result = new MovieList();
         MovieDetail detail = new MovieDetail();
         detail.setVod_id(tid);

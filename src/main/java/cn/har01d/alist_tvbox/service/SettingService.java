@@ -96,6 +96,7 @@ public class SettingService {
         settingRepository.save(new Setting("install_mode", environment.getProperty("INSTALL", "xiaoya")));
         appProperties.setMerge(settingRepository.findById("merge_site_source").map(Setting::getValue).orElse("").equals("true"));
         appProperties.setHeartbeat(settingRepository.findById("bilibili_heartbeat").map(Setting::getValue).orElse("").equals("true"));
+        appProperties.setActionSeparateLine(settingRepository.findById("bilibili_action_separate_line").map(Setting::getValue).orElse("").equals("true"));
         appProperties.setSupportDash(settingRepository.findById("bilibili_dash").map(Setting::getValue).orElse("").equals("true"));
         appProperties.setReplaceAliToken(settingRepository.findById("replace_ali_token").map(Setting::getValue).orElse("").equals("true"));
         appProperties.setEnableHttps(settingRepository.findById("enable_https").map(Setting::getValue).orElse("").equals("true"));
@@ -107,29 +108,34 @@ public class SettingService {
                 .map(Setting::getValue).filter(StringUtils::isNotBlank).orElse("token"));
         appProperties.setMix(!settingRepository.findById("mix_site_source").map(Setting::getValue).orElse("").equals("false"));
         appProperties.setLiveHotMode(normalizeLiveHotMode(settingRepository.findById("live_hot_mode").map(Setting::getValue).orElse(null)));
+        // 未配置过时保留 AppProperties 默认值(默认隐藏花椒,见其注释);配置存在则完全以用户值为准
+        settingRepository.findById("live_hidden_platforms")
+                .ifPresent(s -> appProperties.setLiveHiddenPlatforms(parseList(s.getValue())));
+        appProperties.setLivePlatformOrder(parseList(settingRepository.findById("live_platform_order").map(Setting::getValue).orElse("")));
+        appProperties.setLiveProxyMode(normalizeLiveProxyMode(settingRepository.findById("live_proxy_mode").map(Setting::getValue).orElse(null)));
         appProperties.setSearchable(!settingRepository.findById("bilibili_searchable").map(Setting::getValue).orElse("").equals("false"));
         appProperties.setTgSearch(settingRepository.findById("tg_search").map(Setting::getValue).orElse(""));
         appProperties.setTgSearchApiKey(settingRepository.findById("tg_search_api_key").map(Setting::getValue).orElse(""));
         appProperties.setPanCheckUrl(settingRepository.findById("pan_check_url").map(Setting::getValue).orElse(""));
         appProperties.setPanCheckTimeoutMs(settingRepository.findById("pan_check_timeout_ms").map(Setting::getValue)
-                .filter(StringUtils::isNotBlank).map(v -> Integer.parseInt(v.trim())).orElse(null));
+                .filter(StringUtils::isNotBlank).map(v -> parseIntOrNull("pan_check_timeout_ms", v)).orElse(null));
         appProperties.setPanSouUrl(settingRepository.findById("pan_sou_url").map(Setting::getValue).orElse(""));
         appProperties.setPanSouSource(settingRepository.findById("pan_sou_source").map(Setting::getValue).orElse("all"));
         appProperties.setPanSouChannels(settingRepository.findById("pan_sou_channels").map(Setting::getValue).map(this::normalizePanSouChannels).orElse("custom"));
         appProperties.setPanSouUsername(settingRepository.findById("pan_sou_username").map(Setting::getValue).orElse(""));
         appProperties.setPanSouPassword(settingRepository.findById("pan_sou_password").map(Setting::getValue).orElse(""));
         appProperties.setPanSouLinkCheckEnabled(settingRepository.findById("pan_sou_link_check_enabled").map(Setting::getValue).orElse("").equals("true"));
-        appProperties.setPanSouLinkCheckMaxCount(settingRepository.findById("pan_sou_link_check_max_count").map(Setting::getValue).map(Integer::parseInt).orElse(300));
+        appProperties.setPanSouLinkCheckMaxCount(settingRepository.findById("pan_sou_link_check_max_count").map(Setting::getValue).map(v -> parseIntOrDefault("pan_sou_link_check_max_count", v, 300)).orElse(300));
         appProperties.setPanSouLinkCheckTypes(parseList(settingRepository.findById("pan_sou_link_check_types").map(Setting::getValue).orElse("")));
         appProperties.setPanSouConc(settingRepository.findById("pan_sou_conc").map(Setting::getValue)
-                .filter(StringUtils::isNotBlank).map(v -> Integer.parseInt(v.trim())).orElse(null));
+                .filter(StringUtils::isNotBlank).map(v -> parseIntOrNull("pan_sou_conc", v)).orElse(null));
         appProperties.setPanSouRefresh(settingRepository.findById("pan_sou_refresh").map(Setting::getValue).orElse("").equals("true"));
         appProperties.setPanSouRes(settingRepository.findById("pan_sou_res").map(Setting::getValue).filter(StringUtils::isNotBlank).orElse("merge"));
         appProperties.setPanSouFilterInclude(parseList(settingRepository.findById("pan_sou_filter_include").map(Setting::getValue).orElse("")));
         appProperties.setPanSouFilterExclude(parseList(settingRepository.findById("pan_sou_filter_exclude").map(Setting::getValue).orElse("")));
         appProperties.setTgSortField(settingRepository.findById("tg_sort_field").map(Setting::getValue).orElse("time"));
-        appProperties.setTempShareExpiration(settingRepository.findById("temp_share_expiration").map(Setting::getValue).map(Integer::parseInt).orElse(72));
-        appProperties.setValidateSharesInterval(settingRepository.findById("validateSharesInterval").map(Setting::getValue).map(Integer::parseInt).orElse(4));
+        appProperties.setTempShareExpiration(settingRepository.findById("temp_share_expiration").map(Setting::getValue).map(v -> parseIntOrDefault("temp_share_expiration", v, 72)).orElse(72));
+        appProperties.setValidateSharesInterval(settingRepository.findById("validateSharesInterval").map(Setting::getValue).map(v -> parseIntOrDefault("validateSharesInterval", v, 4)).orElse(4));
         appProperties.setLocalProxyConfig(loadLocalProxyConfig());
         appProperties.setDanmakuConfig(loadDanmakuConfig());
         appProperties.setQns(settingRepository.findById("bilibili_qn").map(Setting::getValue).map(e -> e.split(",")).map(Arrays::asList).orElse(List.of()));
@@ -159,7 +165,7 @@ public class SettingService {
         if (StringUtils.isBlank(value)) {
             settingRepository.save(new Setting("tg_timeout", String.valueOf(appProperties.getTgTimeout())));
         } else {
-            appProperties.setTgTimeout(Integer.parseInt(value));
+            appProperties.setTgTimeout(parseIntOrDefault("tg_timeout", value, appProperties.getTgTimeout()));
         }
         value = settingRepository.findById("search_excluded_paths").map(Setting::getValue).orElse("");
         String old = "/电视剧/韩国,/电视剧/英国,/电视剧/港台,/电视剧/泰剧,/电视剧/欧美,/电视剧/日本,/电视剧/新加坡,/电视剧/中国/七米蓝";
@@ -176,14 +182,45 @@ public class SettingService {
         if (!settingRepository.existsById("api_key")) {
             generateApiKey();
         }
+        Utils.setTrustedProxies(Arrays.stream(settingRepository.findById("trusted_proxies").map(Setting::getValue).orElse("").split(","))
+                .map(String::trim).filter(StringUtils::isNotBlank).collect(Collectors.toSet()));
         initBasicAuthCredentials();
         appProperties.setSystemId(value);
         log.info("system id: {}", value);
     }
 
+    /** 启动装配用:脏配置回退默认值并告警 —— 单条配置写坏不该 brick 整个启动(启动失败连修复入口都没有)。 */
+    private int parseIntOrDefault(String key, String value, int defaultValue) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            log.warn("setting {} has invalid number '{}', fallback to {}", key, value, defaultValue);
+            return defaultValue;
+        }
+    }
+
+    private Integer parseIntOrNull(String key, String value) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            log.warn("setting {} has invalid number '{}', ignored", key, value);
+            return null;
+        }
+    }
+
+    /** 配置更新用:非数字直接 400,不落库不 500。 */
+    private int requireInt(String key, String value) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new BadRequestException("配置 " + key + " 必须是数字: " + value);
+        }
+    }
+
+    /** 空白返回空列表而非 null:调用方有 String.join(",", ...) 直接消费,null 会 NPE(live 平台管理空保存,#1083)。 */
     private List<String> parseList(String value) {
         if (StringUtils.isBlank(value)) {
-            return null;
+            return List.of();
         }
         return Arrays.stream(value.split(",")).map(String::trim).filter(StringUtils::isNotBlank).toList();
     }
@@ -253,13 +290,16 @@ public class SettingService {
     }
 
     @Scheduled(cron = "0 0 6 * * *")
-    public File backupDatabase() {
+    public synchronized File backupDatabase() {
         if (environment.matchesProfiles("mysql")) {
             return null;
         }
 
+        // MOVIE/META/ALIAS 有意排除(豆瓣数据走 diff 增量链路,全量导出会让备份巨大;恢复端由
+        // FlywayRepairConfig 补建空表)。FLYWAY_SCHEMA_HISTORY 必须随备份走:恢复出的库若没有
+        // 迁移历史,baseline-on-migrate 会把库打到版本 1 并在已演进的结构上重放 V2+,启动必炸
+        // ——即 database.zip 反复删库重建却恢复不生效的根因。
         Set<String> blacklist = Set.of(
-                "FLYWAY_SCHEMA_HISTORY",
                 "META",
                 "MOVIE",
                 "ALIAS",
@@ -270,27 +310,38 @@ public class SettingService {
             List<String> tables = listTables();
             log.debug("tables: {}  blacklist: {}", tables, blacklist);
 
+            // 标识符必须加引号：H2 未加引号的标识符折叠为大写，而 Flyway 11 的历史表是带引号小写
+            // (flyway_schema_history) 存储的，裸写会被解析成 FLYWAY_SCHEMA_HISTORY 而报表不存在。
+            // SHOW TABLES 返回的就是精确存储名，逐个加引号后按原名精确匹配，对大写业务表无影响。
             String tableList = tables.stream()
                     .filter(t -> blacklist.stream().noneMatch(b -> b.equalsIgnoreCase(t)))
+                    .map(t -> "\"" + t.replace("\"", "\"\"") + "\"")
                     .collect(Collectors.joining(", "));
 
             log.info("backup database tables: {}", tableList);
-            File dir = new File("/tmp");
-            File sqlFile = new File(dir, "script.sql");
+            // 固定 /tmp/script.sql:定时与手动并发写同一路径产出交错损坏;且全库明文(含 basic-auth 密码)残留磁盘 —— 用随机临时文件并 finally 删除
+            File sqlFile = Files.createTempFile("atv-backup-", ".sql").toFile();
 
-            jdbcTemplate.execute("SCRIPT TO '" + sqlFile.getAbsolutePath() + "' TABLE " + tableList);
+            try {
+                jdbcTemplate.execute("SCRIPT TO '" + sqlFile.getAbsolutePath() + "' TABLE " + tableList);
 
-            File out = Utils.getDataPath(
-                    "backup",
-                    backupFilename("database-")
-            ).toFile();
+                File out = Utils.getDataPath(
+                        "backup",
+                        backupFilename("database-")
+                ).toFile();
 
-            try (FileOutputStream fos = new FileOutputStream(out);
-                 ZipOutputStream zipOut = new ZipOutputStream(fos)) {
-                Utils.zipFile(sqlFile, sqlFile.getName(), zipOut);
+                try (FileOutputStream fos = new FileOutputStream(out);
+                     ZipOutputStream zipOut = new ZipOutputStream(fos)) {
+                    // 条目名必须固定为 script.sql:H2 RunScript 的 COMPRESSION ZIP 硬编码只认
+                    // 这个名字(File not found: "script.sql in ..." 即条目名不符),此前用临时
+                    // 文件名作条目导致 database.zip 恢复必然失败、init 反复删库重建。
+                    Utils.zipFile(sqlFile, "script.sql", zipOut);
+                }
+                cleanBackups();
+                return out;
+            } finally {
+                Files.deleteIfExists(sqlFile.toPath());
             }
-            cleanBackups();
-            return out;
         } catch (Exception e) {
             log.warn("backup database failed", e);
         }
@@ -435,12 +486,20 @@ public class SettingService {
         return "mix".equals(value) || "none".equals(value) ? value : "folder";
     }
 
+    private String normalizeLiveProxyMode(String value) {
+        // 默认直连优先(dual):未配置/非法值回落默认,显式配置"proxy"才全代理
+        return "proxy".equals(value) ? "proxy" : "dual";
+    }
+
     public Setting update(Setting setting) {
         if ("merge_site_source".equals(setting.getName())) {
             appProperties.setMerge("true".equals(setting.getValue()));
         }
         if ("bilibili_heartbeat".equals(setting.getName())) {
             appProperties.setHeartbeat("true".equals(setting.getValue()));
+        }
+        if ("bilibili_action_separate_line".equals(setting.getName())) {
+            appProperties.setActionSeparateLine("true".equals(setting.getValue()));
         }
         if ("bilibili_searchable".equals(setting.getName())) {
             appProperties.setSearchable("true".equals(setting.getValue()));
@@ -458,6 +517,18 @@ public class SettingService {
             setting.setValue(normalizeLiveHotMode(setting.getValue()));
             appProperties.setLiveHotMode(setting.getValue());
         }
+        if ("live_hidden_platforms".equals(setting.getName())) {
+            setting.setValue(String.join(",", parseList(setting.getValue())));
+            appProperties.setLiveHiddenPlatforms(parseList(setting.getValue()));
+        }
+        if ("live_platform_order".equals(setting.getName())) {
+            setting.setValue(String.join(",", parseList(setting.getValue())));
+            appProperties.setLivePlatformOrder(parseList(setting.getValue()));
+        }
+        if ("live_proxy_mode".equals(setting.getName())) {
+            setting.setValue(normalizeLiveProxyMode(setting.getValue()));
+            appProperties.setLiveProxyMode(setting.getValue());
+        }
         if ("replace_ali_token".equals(setting.getName())) {
             appProperties.setReplaceAliToken("true".equals(setting.getValue()));
         }
@@ -474,10 +545,10 @@ public class SettingService {
             appProperties.setPlaybackSyncScope(StringUtils.isBlank(setting.getValue()) ? "token" : setting.getValue());
         }
         if ("temp_share_expiration".equals(setting.getName())) {
-            appProperties.setTempShareExpiration(Integer.parseInt(setting.getValue()));
+            appProperties.setTempShareExpiration(requireInt("temp_share_expiration", setting.getValue()));
         }
         if ("validateSharesInterval".equals(setting.getName())) {
-            appProperties.setValidateSharesInterval(Integer.parseInt(setting.getValue()));
+            appProperties.setValidateSharesInterval(requireInt("validateSharesInterval", setting.getValue()));
         }
         if ("tg_drivers".equals(setting.getName())) {
             String value = StringUtils.isBlank(setting.getValue()) ? Constants.TG_DRIVERS : setting.getValue();
@@ -491,7 +562,12 @@ public class SettingService {
             appProperties.setTgDriverOrder(Arrays.stream(value.split(",")).toList());
         }
         if ("tg_timeout".equals(setting.getName())) {
-            appProperties.setTgTimeout(Integer.parseInt(setting.getValue()));
+            appProperties.setTgTimeout(requireInt("tg_timeout", setting.getValue()));
+        }
+        if ("trusted_proxies".equals(setting.getName())) {
+            // 信任反代列表:仅这些地址的请求才采信 X-Forwarded-For(逗号分隔,支持 192.168./* 前缀)
+            Utils.setTrustedProxies(Arrays.stream(setting.getValue().split(","))
+                    .map(String::trim).filter(StringUtils::isNotBlank).collect(Collectors.toSet()));
         }
         if ("tg_search".equals(setting.getName())) {
             if (setting.getValue().endsWith("/")) {
@@ -531,7 +607,7 @@ public class SettingService {
             if (StringUtils.isBlank(setting.getValue())) {
                 appProperties.setPanCheckTimeoutMs(null);
             } else {
-                appProperties.setPanCheckTimeoutMs(Math.max(0, Integer.parseInt(setting.getValue().trim())));
+                appProperties.setPanCheckTimeoutMs(Math.max(0, requireInt("pan_check_timeout_ms", setting.getValue())));
             }
         }
         if ("pan_sou_source".equals(setting.getName())) {
@@ -552,7 +628,7 @@ public class SettingService {
             appProperties.setPanSouLinkCheckEnabled("true".equals(setting.getValue()));
         }
         if ("pan_sou_link_check_max_count".equals(setting.getName())) {
-            int value = Math.max(0, Integer.parseInt(setting.getValue()));
+            int value = Math.max(0, requireInt("pan_sou_link_check_max_count", setting.getValue()));
             setting.setValue(String.valueOf(value));
             appProperties.setPanSouLinkCheckMaxCount(value);
         }
@@ -566,7 +642,7 @@ public class SettingService {
             if (StringUtils.isBlank(setting.getValue())) {
                 appProperties.setPanSouConc(null);
             } else {
-                appProperties.setPanSouConc(Math.max(0, Integer.parseInt(setting.getValue().trim())));
+                appProperties.setPanSouConc(Math.max(0, requireInt("pan_sou_conc", setting.getValue())));
             }
         }
         if ("pan_sou_refresh".equals(setting.getName())) {

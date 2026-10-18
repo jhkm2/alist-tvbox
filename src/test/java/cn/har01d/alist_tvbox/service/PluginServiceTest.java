@@ -204,6 +204,16 @@ class PluginServiceTest {
     }
 
     @Test
+    void pythonPluginClassifierShouldAcceptUriIllegalCharactersInFileName() {
+        // 文件名含 URI 非法字符时 URI.create 抛 Illegal character in path,须回退字符串判定 (#1081)
+        assertThat(PluginService.isPythonPluginUrl("/static/plugins/[短]红豆短剧.py")).isTrue();
+        assertThat(PluginService.isPythonPluginUrl("/static/plugins/红豆 短剧.py")).isTrue();
+        assertThat(PluginService.isPythonPluginUrl("https://example.com/a[b].py?raw=1")).isTrue();
+        assertThat(PluginService.isPythonPluginUrl("/static/plugins/[短]红豆短剧.txt")).isFalse();
+        assertThat(PluginService.isPythonPluginUrl("/static/plugins/[短]红豆短剧.py.bak")).isFalse();
+    }
+
+    @Test
     void updateShouldRedownloadWhenUrlChangesAndReplaceContent() {
         Plugin plugin = new Plugin();
         plugin.setId(15);
@@ -703,5 +713,39 @@ class PluginServiceTest {
         assertThat(result.failed().getFirst()).contains(pluginUrl);
         assertThat(existing.getContent()).isEqualTo("stable");
         assertThat(existing.getLastError()).contains("插件地址不可访问");
+    }
+
+    @Test
+    void upsertWebPageInsertsNewRowAtFrontOfPlugins() {
+        when(pluginRepository.findByUrl("/static/webhome/pages/emby.html")).thenReturn(Optional.empty());
+        when(pluginRepository.save(any(Plugin.class))).thenAnswer(invocation -> {
+            Plugin saved = invocation.getArgument(0);
+            if (saved.getId() == null) {
+                saved.setId(5);
+            }
+            return saved;
+        });
+
+        Plugin result = pluginService.upsertWebPage("/static/webhome/pages/emby.html", "emby");
+
+        assertThat(result.getUrl()).isEqualTo("/static/webhome/pages/emby.html");
+        assertThat(result.getName()).isEqualTo("emby");
+        // 新建落插件区最前(内置源之后、其它插件之前),不沉底
+        verify(subscriptionSourceService).moveToFrontOfPlugins("plugin-5");
+    }
+
+    @Test
+    void upsertWebPageRescanKeepsPosition() {
+        Plugin existing = new Plugin();
+        existing.setId(5);
+        existing.setUrl("/static/webhome/pages/emby.html");
+        existing.setName("emby");
+        when(pluginRepository.findByUrl("/static/webhome/pages/emby.html")).thenReturn(Optional.of(existing));
+        when(pluginRepository.save(existing)).thenReturn(existing);
+
+        pluginService.upsertWebPage("/static/webhome/pages/emby.html", "emby");
+
+        // 重扫只刷新检查时间,不重排用户调过的顺序
+        verify(subscriptionSourceService, never()).moveToFrontOfPlugins(org.mockito.ArgumentMatchers.anyString());
     }
 }

@@ -73,9 +73,11 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -103,7 +105,29 @@ public class TelegramService {
     private final ExecutorService executorService = Executors.newFixedThreadPool(Math.min(10, Runtime.getRuntime().availableProcessors() * 2));
     private final OkHttpClient httpClient = new OkHttpClient();
     private final LoadingCache<String, List<Message>> searchCache = Caffeine.newBuilder().expireAfterWrite(Duration.ofMinutes(15)).build(this::getFromChannel);
+    /** 共享缓存对象契约:返回的 MovieList/MovieDetail 被多请求复用,消费方要么只读、要么先拷贝再改写
+     *  (MediaLibraryController/pianDan toNavigationList 均为拷贝式)—— 就地 set 会跨请求污染缓存。 */
     private final Cache<String, MovieList> douban = Caffeine.newBuilder().expireAfterWrite(Duration.ofHours(1)).build();
+
+    /** 分类类目 → recommend tags 基础词(2026-09 实测:类型/题材/地区/年代多词任意叠加,动画词自带剧集语义)。 */
+    private static final Map<String, String> DOUBAN_CATEGORY_BASE_TAGS = Map.of(
+            "tv_domestic", "电视剧",
+            "tv_american", "电视剧",
+            "tv_korean", "电视剧",
+            "tv_japanese", "电视剧",
+            "tv_animation", "动画",
+            "tv_variety_show", "综艺"
+    );
+    /** 类目默认地区:带筛选降级条件选片且用户未选地区时保留类目语义(欧美剧固定到美国,官方词表无「欧美」词)。 */
+    private static final Map<String, String> DOUBAN_CATEGORY_DEFAULT_REGIONS = Map.of(
+            "tv_domestic", "中国大陆",
+            "tv_american", "美国",
+            "tv_korean", "韩国",
+            "tv_japanese", "日本"
+    );
+    private static final Set<String> DOUBAN_RECOMMEND_SORTS = Set.of("T", "U", "R", "S");
+    /** recommend 服务端页大小恒 20(请求 limit 被忽略),start 步进与 pagecount 都按它算。 */
+    private static final int DOUBAN_RECOMMEND_PAGE_SIZE = 20;
     private final Cache<String, String> lastId = Caffeine.newBuilder().expireAfterWrite(Duration.ofHours(1)).build();
     private final Cache<String, MovieDetail> movies = Caffeine.newBuilder().maximumSize(200).expireAfterWrite(Duration.ofHours(2)).build();
     private final Cache<String, String> videoName = Caffeine.newBuilder().maximumSize(200).expireAfterWrite(Duration.ofHours(2)).build();
@@ -758,16 +782,19 @@ public class TelegramService {
         return result;
     }
 
-    public MovieList listDouban(String type, String ac, String sort, Integer year, String genre, String region, int page, int size) {
+    /** year 接受单年("2024")与年代段词("2020年代"):前者 local 本地库查询转数字,后者只对 recommend 条件选片有意义。 */
+    public MovieList listDouban(String type, String ac, String sort, String year, String genre, String region, int page, int size) {
         if (type.startsWith("s:")) {
-            return searchMovies(type.substring(2), false, size);
+            // s: 条目 id 带 @{年} 内嵌后缀,搜索只认裸标题
+            return searchMovies(PianDanService.parseSubjectId(type).name(), false, size);
         }
 
         return getDoubanList(type, ac, sort, year, genre, region, page, size);
     }
 
-    private MovieList getDoubanList(String type, String ac, String sort, Integer year, String genre, String region, int page, int size) {
-        String key = ac + "-" + type + "-" + page + "-" + StringUtils.defaultString(sort) + "-" + year
+    private MovieList getDoubanList(String type, String ac, String sort, String year, String genre, String region, int page, int size) {
+        // key 含 size:用户可控 size(默认 30)不同值同 key 会互相污染,命中缓存返回错乱页大小
+        String key = ac + "-" + type + "-" + page + "-" + size + "-" + StringUtils.defaultString(sort) + "-" + year
                 + "-" + StringUtils.defaultString(genre) + "-" + StringUtils.defaultString(region);
         MovieList result = douban.getIfPresent(key);
         if (result != null) {
@@ -775,7 +802,7 @@ public class TelegramService {
         }
 
         if (type.equals("local")) {
-            return getLocalMovieList(ac, sort, year, genre, region, page, size);
+            return getLocalMovieList(ac, sort, toYear(year), genre, region, page, size);
         }
 
         if (type.equals("random")) {
@@ -783,11 +810,26 @@ public class TelegramService {
         }
 
         if (type.startsWith("suggestion_")) {
-            return getDoubanItems(type, ac, page, size, region);
+            return getDoubanItems(type, ac, page, size, key);
         }
 
         if (type.startsWith("hot_")) {
-            return getDoubanItems(type, ac, page, size, region);
+            if (hasDoubanFilters(sort, year, genre, region)) {
+                boolean tv = type.equals("hot_tv");
+                return getRecommendList(tv ? "tv" : "movie",
+                        buildRecommendTags(tv ? "电视剧" : "电影", region, genre, year), sort, page, ac, key);
+            }
+            return getDoubanItems(type, ac, page, size, key);
+        }
+
+        // 分类类目带筛选降级条件选片(同 TMDB upgradeFixedListFilters 手法):不带筛选维持原站固定列表。
+        // 地区未选时回落类目默认地区(国产剧/韩剧等类目语义在 tags 里靠它保留),显式选择则覆盖。
+        String baseTags = DOUBAN_CATEGORY_BASE_TAGS.get(type);
+        if (baseTags != null && hasDoubanFilters(sort, year, genre, region)) {
+            String defaultRegion = DOUBAN_CATEGORY_DEFAULT_REGIONS.getOrDefault(type, "");
+            return getRecommendList("tv",
+                    buildRecommendTags(baseTags, StringUtils.defaultIfBlank(region, defaultRegion), genre, year),
+                    sort, page, ac, key);
         }
 
         result = new MovieList();
@@ -851,7 +893,7 @@ public class TelegramService {
 
         for (Movie movie : res) {
             MovieDetail movieDetail = new MovieDetail();
-            movieDetail.setVod_id(PianDanService.subjectId(movie.getName(), movie.getYear()));
+            movieDetail.setVod_id(PianDanService.doubanSubjectId(movie.getId()));
             movieDetail.setVod_name(movie.getName());
             movieDetail.setVod_pic(movie.getCover());
             movieDetail.setVod_remarks(movie.getDbScore());
@@ -901,7 +943,8 @@ public class TelegramService {
 
         int total = (int) movieRepository.count();
         int count = size + size / 2;
-        int page = ThreadLocalRandom.current().nextInt(total / count);
+        // 空库(total=0)或 total<count 时 nextInt(0) 抛 IllegalArgumentException → 固定第 0 页
+        int page = total > count ? ThreadLocalRandom.current().nextInt(total / count) : 0;
         Collections.shuffle(fields);
         List<Sort.Order> orders = fields.stream().limit(3).map(e -> ThreadLocalRandom.current().nextBoolean() ? Sort.Order.asc(e) : Sort.Order.desc(e)).toList();
         Sort sort = Sort.by(orders);
@@ -913,7 +956,7 @@ public class TelegramService {
 
         for (Movie movie : movies.subList(0, size)) {
             MovieDetail movieDetail = new MovieDetail();
-            movieDetail.setVod_id(PianDanService.subjectId(movie.getName(), movie.getYear()));
+            movieDetail.setVod_id(PianDanService.doubanSubjectId(movie.getId()));
             movieDetail.setVod_name(movie.getName());
             movieDetail.setVod_pic(movie.getCover());
             movieDetail.setVod_remarks(movie.getDbScore());
@@ -938,8 +981,7 @@ public class TelegramService {
         return result;
     }
 
-    private MovieList getDoubanItems(String type, String ac, int page, int size, String region) {
-        String key = ac + "-" + type + "-" + page + "-" + StringUtils.defaultString(region);
+    private MovieList getDoubanItems(String type, String ac, int page, int size, String cacheKey) {
         int start = (page - 1) * size;
         String url = "https://m.douban.com/rexxar/api/v2/subject/recent_hot/movie?limit=" + size + "&start=" + start;
         if (type.equals("hot_tv")) {
@@ -949,13 +991,46 @@ public class TelegramService {
         } else if (type.equals("suggestion_tv")) {
             url = "https://m.douban.com/rexxar/api/v2/tv/suggestion?start=" + start + "&count=" + size + "&new_struct=1&with_review=1&for_mobile=1";
         }
-        // 近期热播接口不支持地区参数;带地区改走 discover 式 recommend(tags 语法,单国家粒度)
-        if (StringUtils.isNotBlank(region) && (type.equals("hot_tv") || type.equals("hot_movie"))) {
-            String tags = URLEncoder.encode((type.equals("hot_tv") ? "电视剧" : "电影") + "," + region, StandardCharsets.UTF_8);
-            // sort=U 近期热度:recommend 默认综合排序全是经典老剧,与热门榜单语义不符
-            url = "https://m.douban.com/rexxar/api/v2/" + (type.equals("hot_tv") ? "tv" : "movie")
-                    + "/recommend?refresh=0&start=" + start + "&limit=" + size + "&uncollect=false&sort=U&tags=" + tags;
+
+        MovieList result = new MovieList();
+        List<MovieDetail> list = new ArrayList<>();
+
+        HttpEntity<Void> httpEntity = buildHttpEntity();
+
+        var response = restTemplate.exchange(URI.create(url), HttpMethod.GET, httpEntity, JsonNode.class);
+        int total = response.getBody().get("total").asInt();
+        ArrayNode items = (ArrayNode) response.getBody().get("items");
+        for (JsonNode item : items) {
+            MovieDetail movieDetail = getMovieDetail(item);
+            if ("web".equals(ac)) {
+                fixCover(movieDetail);
+                movieDetail.setCate(null);
+            }
+            list.add(movieDetail);
         }
+
+        result.setList(list);
+        result.setLimit(list.size());
+        result.setTotal(total);
+        result.setPagecount((total + size - 1) / size);
+
+        douban.put(cacheKey, result);
+        log.debug("list result: {}", result);
+        return result;
+    }
+
+    /**
+     * 豆瓣条件选片(recommend?tags= 语法,2026-09 实测):类型/题材/地区/年代多词任意叠加,
+     * 排序四态 T综合/U近期热度/R首播时间/S高分优先,无效词显式返回 total=0。
+     * 服务端页大小恒 20(请求 limit 被忽略):start 步进与 pagecount 都按 20 算,
+     * 防上层按 size=24 步进导致每页漏条(web/TVBox 共用 pianDanList 固定 size=24)。
+     */
+    private MovieList getRecommendList(String kind, String tags, String sort, int page, String ac, String cacheKey) {
+        String sortValue = sort != null && DOUBAN_RECOMMEND_SORTS.contains(sort) ? sort : "U";
+        int start = (page - 1) * DOUBAN_RECOMMEND_PAGE_SIZE;
+        String encoded = URLEncoder.encode(tags, StandardCharsets.UTF_8);
+        String url = "https://m.douban.com/rexxar/api/v2/" + kind + "/recommend?refresh=0&start=" + start
+                + "&limit=" + DOUBAN_RECOMMEND_PAGE_SIZE + "&uncollect=false&sort=" + sortValue + "&tags=" + encoded;
 
         MovieList result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
@@ -979,11 +1054,44 @@ public class TelegramService {
         result.setList(list);
         result.setLimit(list.size());
         result.setTotal(total);
-        result.setPagecount((total + size - 1) / size);
+        result.setPagecount((total + DOUBAN_RECOMMEND_PAGE_SIZE - 1) / DOUBAN_RECOMMEND_PAGE_SIZE);
 
-        douban.put(key, result);
+        douban.put(cacheKey, result);
         log.debug("list result: {}", result);
         return result;
+    }
+
+    private static boolean hasDoubanFilters(String sort, String year, String genre, String region) {
+        return StringUtils.isNotBlank(sort) || StringUtils.isNotBlank(year) || StringUtils.isNotBlank(genre) || StringUtils.isNotBlank(region);
+    }
+
+    /** tags 词序固定为 类型,地区,题材,年代(服务端对词序不敏感,固定序保证缓存 key 稳定),重复词去重。 */
+    private static String buildRecommendTags(String baseTags, String region, String genre, String year) {
+        LinkedHashSet<String> parts = new LinkedHashSet<>();
+        for (String word : baseTags.split(",")) {
+            if (StringUtils.isNotBlank(word)) {
+                parts.add(word);
+            }
+        }
+        if (StringUtils.isNotBlank(region)) {
+            parts.add(region);
+        }
+        if (StringUtils.isNotBlank(genre)) {
+            parts.add(genre);
+        }
+        if (StringUtils.isNotBlank(year)) {
+            parts.add(year);
+        }
+        return String.join(",", parts);
+    }
+
+    /** local 本地库的年份等值查询只认数字,年代段词等非数字回落不筛选。 */
+    private static Integer toYear(String year) {
+        try {
+            return StringUtils.isBlank(year) ? null : Integer.valueOf(year);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private static HttpEntity<Void> buildHttpEntity() {
@@ -996,13 +1104,20 @@ public class TelegramService {
     }
 
     private static MovieDetail getMovieDetail(JsonNode item) {
-        double score = item.get("rating").get("value").asDouble();
+        double score = item.path("rating").path("value").asDouble(0);
         MovieDetail movieDetail = new MovieDetail();
         String title = item.get("title").asText();
         Integer year = parseYear(item.path("year").asText(item.path("card_subtitle").asText("")));
-        movieDetail.setVod_id(PianDanService.subjectId(title, year));
+        // rexxar 条目自带豆瓣 subject id:独立 db:{id} 类型(纯数字不嵌标题,爬虫裸拼 GET 不怕 &/# 截断),
+        // 无 id 的条目才回落内嵌标题的 s: 形态
+        String idText = item.path("id").asText("");
+        if (idText.matches("\\d+")) {
+            movieDetail.setVod_id(PianDanService.doubanSubjectId(Integer.parseInt(idText)));
+        } else {
+            movieDetail.setVod_id(PianDanService.subjectId(title, year));
+        }
         movieDetail.setVod_name(title);
-        movieDetail.setVod_pic(item.get("pic").get("normal").asText());
+        movieDetail.setVod_pic(item.path("pic").path("normal").asText(""));
         if (score > 0) {
             movieDetail.setVod_remarks(String.valueOf(score));
         }
@@ -1074,7 +1189,7 @@ public class TelegramService {
 
     private String getUrl(String path) {
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath(path)
                 .replaceQuery(null)
                 .build()
@@ -1349,7 +1464,9 @@ public class TelegramService {
         if (!api.endsWith("/search")) {
             api = api + "/search";
         }
-        String url = api + "?channels=" + channels + "&query=" + keyword + "&size=" + size + "&timeout=" + appProperties.getTgTimeout();
+        // keyword 硬拼 URL:含 & / # 的词会把 query 截断或注入参数,须编码
+        String url = api + "?channels=" + channels + "&query=" + URLEncoder.encode(keyword, StandardCharsets.UTF_8)
+                + "&size=" + size + "&timeout=" + appProperties.getTgTimeout();
         try {
             var response = restTemplate.getForObject(url, SearchResponse.class);
             return response.getMessages().stream().flatMap(this::parseMessage).toList();
@@ -1619,6 +1736,12 @@ public class TelegramService {
     }
 
     public TelegramChannel getChannelByName(String username) {
+        // 真查库:new 旧行为是每次 new 一条(id=count()),create() 反复调用同 username 会插重复行,
+        // id=count() 与 channels.json 显式 id 撞车时 save 变更新静默覆盖已有频道配置
+        TelegramChannel existing = telegramChannelRepository.findByUsername(username);
+        if (existing != null) {
+            return existing;
+        }
         TelegramChannel channel = new TelegramChannel();
         channel.setId(telegramChannelRepository.count());
         channel.setUsername(username);

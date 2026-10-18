@@ -36,6 +36,7 @@ AList-TvBox 是一个功能强大的云存储聚合工具，专为 TvBox 客户�
 - **安全订阅**: Token认证机制，防止订阅地址泄露
 - **Python插件**: 通过 csp_PyProxy 加载 Python 爬虫，支持本地代理加速
 - **订阅源管理**: 拖拽排序、启用/禁用、自定义order字段控制顺序
+- **影视首页**: 上传网页即成首页站点（自定义网页源），搜索/继续观看/网盘直开/盘搜/盘检开箱即用
 
 ### 索引与刮削
 - **构建索引**: 支持增量索引、压缩索引、自定义深度
@@ -419,6 +420,7 @@ tvbox/my.json和juhe.json不能在TvBox直接使用，请使用订阅地址！
 - **csp_TgWeb** - 电报网页搜索
 - **csp_FishPanSou** - 鱼佬盘搜
 - **csp_FishPanSouGroup** - 盘搜（分组模式）
+- **csp_WebHome** - 影视首页（网页首页，支持自定义网页源）
 - **csp_Push** - 推送
 
 支持的订阅源类型：
@@ -428,6 +430,16 @@ tvbox/my.json和juhe.json不能在TvBox直接使用，请使用订阅地址！
 - Jellyfin站点
 - 飞牛影视站点
 - Python爬虫插件
+- 自定义网页源
+
+#### 影视首页与自定义网页源
+把一个网页做成 TvBox 的首页站点：进站即全屏打开页面，遥控器操作，可直接搜索、继续观看、跳转播放。同一份页面在两类客户端零改动通用——webhtv/fish 按原生首页渲染，原版 FongMi/OK影视 等普通端由内置 `spring.jar` 的 `csp_WebHome` 以全屏 WebView 加载并注入标准 `fm` SDK。
+
+- **开启**：订阅源管理勾选内置源「影视首页」；上传自己的页面即成为自定义网页源
+- **上传**：管理页面「文件 → 静态文件」进入 `webhome/pages/` 目录上传 HTML（单文件即可，zip 可带 css/js/图片等相对资源），刷新订阅配置后自动出现在站点列表，可排序/改名
+- **页面能力**（页面通过 `fm` SDK 调用，普通端自动补齐）：网络请求（无 CORS 限制）、最近观看、跳转原生详情/搜索/直播/收藏/设置、网盘分享直开（自动带提取码）、盘搜、分享链接有效性检测、防盗链图片代理
+- **自动后端**：页面访问公开盘搜站的请求会自动改走本服务（需在配置里设置盘搜地址并启用 token，上游与登录由服务端承担）；盘检同样走服务端批量验证
+- 开发与移植规范（fm SDK 契约、兼容红线、常见坑）见[网页开发指南](../docs/webhome-page-dev-guide.md)
 
 
 ### 追剧
@@ -580,7 +592,7 @@ TvBox接口：
 - https://api.xhofe.top/alist/ali_open/token
 - https://api.nn.ci/alist/ali_open/token
 
-如果nginx配置了SSL，需要在高级设置中打开`订阅域名支持HTTPS`开关。
+通过 nginx/Caddy 等反代配置 SSL 时，后端会自动根据转发头 `X-Forwarded-Proto` 识别客户端实际访问协议，订阅里的链接会自动使用 `https`。若反代未传递该头，需在高级设置中打开`订阅域名支持HTTPS`开关。
 
 #### 高级设置
 可配置项：
@@ -815,13 +827,13 @@ H2 / MySQL / PostgreSQL 之间迁移请使用 JSON 备份路径，详见 [数据
 - `m. 数据库迁移`：进入 H2 / MySQL / PostgreSQL 迁移与数据库配置菜单。支持迁移向导、配置/切换主应用数据库、导出 JSON、导入 JSON、回退到迁移前数据库。迁移向导会自动执行“导出当前数据 → 切换数据库并重建容器 → 导入恢复”。容器未运行但已有 JSON 备份时也可继续；今天的备份自动使用，更早的备份需要确认。
 - `8. 配置管理` → `a. 数据恢复`：列出 `backup/` 下所有备份，按文件名自动识别 `[JSON]` / `[SQL]`，**JSON 排在前面优先**。选择后：
   - JSON → 复制为 `database-json.zip` 并重启容器，应用启动时自动以覆盖方式恢复。
-  - SQL → 复制为 `database.zip`、删除 `atv.mv.db` / `atv.trace.db` 并重启，启动时执行 `script.sql` 恢复。
+  - SQL → 复制为 `database.zip`、旧库移为 `atv.mv.db.bak` 保留并重启，启动时执行恢复；失败自动回滚原库并把包改名为 `database.zip.failed`（改回原名可重试）。
 - `8. 配置管理` → `b. 立即备份数据库`：立即生成一份 JSON 备份（JSON 失败时回退 SQL；容器未运行时回退裸 `atv.mv.db`）。
 
 #### 手动恢复
 
 - JSON：把 `database-json-*.zip` 复制为 `/opt/alist-tvbox/database-json.zip`，重启容器（**不要**删除 `atv.mv.db`）。应用启动时自动恢复并重启一次以加载数据。
-- SQL（H2）：把 `database-*.zip` 复制为 `/opt/alist-tvbox/database.zip`，删除 `atv.mv.db` 和 `atv.trace.db`，重启 docker 容器或重新运行安装脚本。
+- SQL（H2）：把 `database-*.zip` 复制为 `/opt/alist-tvbox/database.zip`，重启 docker 容器或重新运行安装脚本（**不要**手动删除 `atv.mv.db`，启动脚本会自动备份旧库并在失败时回滚）。
 
 #### 通过配置页面
 

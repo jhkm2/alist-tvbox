@@ -162,6 +162,16 @@ public class MediaSubscription {
     @Column(name = "custom_air_clock", length = 5)
     private String customAirClock;
 
+    /**
+     * 手动更新日(ISO 周一=1..周日=7 的 CSV,如 "2,4" = 周二/周四;空=不限制):欧美周播剧/追番
+     * 固定周几更新,官方日程缺失/不可信时用户显式指定 —— 巡检只落在配置周几的生效播出时刻
+     * (customAirClock 优先,默认 20:00)+15min,其余时间休眠;nextAirTime 同步接管为下一更新日
+     * (详情页「下集播出」/时间轴/播出前休眠同口径)。已播集有缺口时不死等(与官方日程路同语义);
+     * 完结剧不接管(完结周轻查继续)。
+     */
+    @Column(name = "air_weekdays", length = 13)
+    private String airWeekdays;
+
     /** 显式允许跨网盘转存(默认仅同盘:AList 秒传配置允许的方向除外) */
     @Column(name = "cross_drive")
     private boolean crossDrive;
@@ -170,6 +180,12 @@ public class MediaSubscription {
      *  产物落离线账号挂载根/alist-tvbox-offline/,资源行 shareId=null 按挂载路径直接供播 */
     @Column(name = "magnet_offline")
     private boolean magnetOffline;
+
+    /** 115 自有分享(仅 FOLLOW 模式生效,与 TRANSFER 互斥):巡检把可看集转存到自有 115 盘
+     *  建永久分享快照后删盘内源文件释放空间 —— 上游失效不影响已追集数,自有批次永不重列。
+     *  需 cookie 版 115 账号(开放平台无分享 API);单批转存要求瞬时容纳整批文件,空间大的用户才开。 */
+    @Column(name = "self_share")
+    private boolean selfShare;
 
     @Column(nullable = false, length = 16)
     private String status = STATUS_ACTIVE;

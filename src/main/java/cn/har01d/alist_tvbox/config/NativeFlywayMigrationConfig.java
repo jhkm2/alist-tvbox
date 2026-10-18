@@ -44,6 +44,12 @@ import db.migration.current.V47__MediaSubscriptionResourceFailKind;
 import db.migration.current.V48__MediaSubscriptionMagnetOffline;
 import db.migration.current.V49__OfflineDownloadTaskMagnetQuota;
 import db.migration.current.V50__MediaSubscriptionCustomKeywords;
+import db.migration.current.V51__MediaSubscriptionAirWeekdays;
+import db.migration.current.V52__MediaSubscriptionEpisodeFallback;
+import db.migration.current.V53__MediaSubscriptionSelfShare;
+import db.migration.current.V54__OfflineDownloadTaskCleanup;
+import db.migration.current.V55__OfflineDownloadTaskCleanupBackfill;
+import db.migration.current.V56__WatchlistItem;
 import org.springframework.boot.flyway.autoconfigure.FlywayConfigurationCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -118,7 +124,13 @@ public class NativeFlywayMigrationConfig {
                     new V47__MediaSubscriptionResourceFailKind(),
                     new V48__MediaSubscriptionMagnetOffline(),
                     new V49__OfflineDownloadTaskMagnetQuota(),
-                    new V50__MediaSubscriptionCustomKeywords());
+                    new V50__MediaSubscriptionCustomKeywords(),
+                    new V51__MediaSubscriptionAirWeekdays(),
+                    new V52__MediaSubscriptionEpisodeFallback(),
+                    new V53__MediaSubscriptionSelfShare(),
+                    new V54__OfflineDownloadTaskCleanup(),
+                    new V55__OfflineDownloadTaskCleanupBackfill(),
+                    new V56__WatchlistItem());
         };
     }
 }

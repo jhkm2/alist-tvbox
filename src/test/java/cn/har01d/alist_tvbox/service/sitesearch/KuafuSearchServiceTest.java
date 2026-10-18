@@ -1,9 +1,12 @@
 package cn.har01d.alist_tvbox.service.sitesearch;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.dto.SiteCredentialCheckRequest;
+import cn.har01d.alist_tvbox.dto.SiteCredentialCheckResult;
 import cn.har01d.alist_tvbox.dto.tg.Message;
 import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.Request;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -14,6 +17,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -96,7 +100,7 @@ class KuafuSearchServiceTest {
 
     @Test
     void parseCardsSkipsPinnedAndBlockedAndDedupes() {
-        KuafuSearchService service = new KuafuSearchService(settings(null, null), props());
+        KuafuSearchService service = new KuafuSearchService(settings(null, null), props(), new ObjectMapper());
         List<KuafuSearchService.Card> cards = service.parseCards(SEARCH_HTML);
         // 置顶跳过、屏蔽词(性感/写真/福利)丢弃、重复去重
         assertEquals(1, cards.size());
@@ -108,7 +112,7 @@ class KuafuSearchServiceTest {
 
     @Test
     void extractAlertLinksFoldCode() {
-        KuafuSearchService service = new KuafuSearchService(settings(null, null), props());
+        KuafuSearchService service = new KuafuSearchService(settings(null, null), props(), new ObjectMapper());
         List<KuafuSearchService.Extracted> links = service.extractLinks(DETAIL_HTML);
         // Level ① 命中即止:alert 的夸克链接(码折 ?pwd=),第二楼的 123 不进(上级非空)
         assertEquals(1, links.size());
@@ -122,7 +126,7 @@ class KuafuSearchServiceTest {
 
     @Test
     void extractPairsBareCodeWithAnchor() {
-        KuafuSearchService service = new KuafuSearchService(settings(null, null), props());
+        KuafuSearchService service = new KuafuSearchService(settings(null, null), props(), new ObjectMapper());
         List<KuafuSearchService.Extracted> links = service.extractLinks(CODE_ONLY_HTML);
         // Level ②:alert 纯码(无前缀)剥非字母数字后配对 a[href] 的阿里链接
         assertEquals(1, links.size());
@@ -132,7 +136,7 @@ class KuafuSearchServiceTest {
 
     @Test
     void extractRegexFallbackRebuildsCanonicalLinks() {
-        KuafuSearchService service = new KuafuSearchService(settings(null, null), props());
+        KuafuSearchService service = new KuafuSearchService(settings(null, null), props(), new ObjectMapper());
         List<KuafuSearchService.Extracted> links = service.extractLinks(LOCKED_LEAK_HTML);
         // Level ③:锁贴泄漏在 JSON-LD,规范重建(123 按 key 回原文匹配完整 URL)
         assertEquals(3, links.size());
@@ -150,7 +154,7 @@ class KuafuSearchServiceTest {
                   <p>全集打包 <a href="https://www.123pan.cn/s/p333">123盘</a> 提取码:pn11</p>
                 </div></body></html>
                 """;
-        KuafuSearchService service = new KuafuSearchService(settings(null, null), props());
+        KuafuSearchService service = new KuafuSearchService(settings(null, null), props(), new ObjectMapper());
         List<KuafuSearchService.Extracted> links = service.extractLinks(html);
         assertEquals(1, links.size());
         assertEquals("https://www.123pan.cn/s/p333", links.get(0).link());
@@ -162,7 +166,7 @@ class KuafuSearchServiceTest {
         assertTrue(KuafuSearchService.cookieExpired(LOGIN_EXPIRED_HTML));
         assertFalse(KuafuSearchService.cookieExpired(DETAIL_HTML));
         // Cookie 失效帖整体跳过
-        assertTrue(new KuafuSearchService(settings(null, null), props()).extractLinks(LOGIN_EXPIRED_HTML).isEmpty());
+        assertTrue(new KuafuSearchService(settings(null, null), props(), new ObjectMapper()).extractLinks(LOGIN_EXPIRED_HTML).isEmpty());
         assertTrue(KuafuSearchService.blocked("网红私拍合集"));
         assertFalse(KuafuSearchService.blocked("凡人修仙传"));
         assertEquals("https://pan.quark.cn/s/x", KuafuSearchService.fixScheme("pan.quark.cn/s/x"));
@@ -173,7 +177,7 @@ class KuafuSearchServiceTest {
     @Test
     void replyCooldownSkipsAndLoginRejected() {
         AtomicInteger posts = new AtomicInteger();
-        KuafuSearchService primed = new KuafuSearchService(settings(null, "bbs_sid=1; bbs_token=2"), props()) {
+        KuafuSearchService primed = new KuafuSearchService(settings(null, "bbs_sid=1; bbs_token=2"), props(), new ObjectMapper()) {
             @Override
             protected Resp http(Request request) throws IOException {
                 posts.incrementAndGet();
@@ -188,7 +192,7 @@ class KuafuSearchServiceTest {
         assertTrue(System.currentTimeMillis() - start < 2000);
         assertEquals(1, posts.get());
         // 登录标记拒绝
-        KuafuSearchService stale = new KuafuSearchService(settings(null, "bbs_sid=1"), props()) {
+        KuafuSearchService stale = new KuafuSearchService(settings(null, "bbs_sid=1"), props(), new ObjectMapper()) {
             @Override
             protected Resp http(Request request) throws IOException {
                 return new Resp(200, List.of(), "请先登录后发帖");
@@ -201,7 +205,7 @@ class KuafuSearchServiceTest {
     void searchFullChainAnonymousCatchesLeakedLinks() {
         // 无 Cookie 匿名:搜索 + 详情照常,锁贴靠 Level ③ 正则抓泄漏链接(不回复)
         AtomicInteger posts = new AtomicInteger();
-        KuafuSearchService service = new KuafuSearchService(settings("https://www.kfzy.net", null), props()) {
+        KuafuSearchService service = new KuafuSearchService(settings("https://www.kfzy.net", null), props(), new ObjectMapper()) {
             @Override
             protected Resp http(Request request) throws IOException {
                 String url = request.url().toString();
@@ -229,7 +233,7 @@ class KuafuSearchServiceTest {
     @Test
     void searchUnlocksLockedThreadWithCookie() {
         AtomicInteger detailFetches = new AtomicInteger();
-        KuafuSearchService service = new KuafuSearchService(settings("https://www.kfzy.net", "bbs_sid=1; bbs_token=2"), props()) {
+        KuafuSearchService service = new KuafuSearchService(settings("https://www.kfzy.net", "bbs_sid=1; bbs_token=2"), props(), new ObjectMapper()) {
             @Override
             protected Resp http(Request request) throws IOException {
                 String url = request.url().toString();
@@ -254,13 +258,118 @@ class KuafuSearchServiceTest {
     }
 
     @Test
-    void searchFailureIsSilent() {
-        KuafuSearchService service = new KuafuSearchService(settings("https://www.kfzy.net", null), props()) {
+    void searchFailureRethrowsForThrottle() {
+        KuafuSearchService service = new KuafuSearchService(settings("https://www.kfzy.net", null), props(), new ObjectMapper()) {
             @Override
             protected Resp http(Request request) throws IOException {
                 throw new IOException("timeout");
             }
         };
-        assertTrue(service.search("凡人修仙传").isEmpty());
+        assertThrows(IllegalStateException.class, () -> service.search("凡人修仙传"));
+    }
+
+    @Test
+    void dailyCheckinPostsAndIsIdempotentPerDay() {
+        AtomicInteger checkins = new AtomicInteger();
+        KuafuSearchService service = new KuafuSearchService(
+                settings("https://www.kfzy.net", "bbs_sid=1; bbs_token=2"), props(), new ObjectMapper()) {
+            @Override
+            protected Resp http(Request request) throws IOException {
+                String url = request.url().toString();
+                if ("POST".equals(request.method()) && url.equals("https://www.kfzy.net/my-sign.htm")) {
+                    checkins.incrementAndGet();
+                    // 2026-09-13 抓包契约:XHR/Origin/Referer 头 + 空 body + 论坛 Cookie
+                    assertEquals("XMLHttpRequest", request.header("X-Requested-With"));
+                    assertEquals("https://www.kfzy.net", request.header("Origin"));
+                    assertEquals("https://www.kfzy.net/", request.header("Referer"));
+                    assertEquals("bbs_sid=1; bbs_token=2", request.header("Cookie"));
+                    try (okio.Buffer buffer = new okio.Buffer()) {
+                        request.body().writeTo(buffer);
+                        assertEquals("", buffer.readUtf8(), "签到空 body(content-length: 0)");
+                    }
+                    return new Resp(200, List.of(),
+                            "{\"code\": \"0\", \"message\": \"签到成功！您是第493名签到！<br><br>经验:2、金币:3\"}");
+                }
+                throw new AssertionError("签到外不得发任何请求: " + request.url());
+            }
+        };
+        service.dailyCheckin();
+        service.dailyCheckin();
+        assertEquals(1, checkins.get(), "code==0 记当日完成,同日幂等");
+    }
+
+    @Test
+    void dailyCheckinAlreadySignedCountsAsDone() {
+        AtomicInteger checkins = new AtomicInteger();
+        KuafuSearchService service = new KuafuSearchService(
+                settings("https://www.kfzy.net", "bbs_sid=1; bbs_token=2"), props(), new ObjectMapper()) {
+            @Override
+            protected Resp http(Request request) throws IOException {
+                if ("POST".equals(request.method()) && request.url().toString().endsWith("/my-sign.htm")) {
+                    checkins.incrementAndGet();
+                    return new Resp(200, List.of(), "{\"code\": \"1\", \"message\": \"您今天已经签到过了\"}");
+                }
+                return new Resp(404, List.of(), "");
+            }
+        };
+        service.dailyCheckin();
+        service.dailyCheckin();
+        assertEquals(1, checkins.get(), "已签文案同样记当日完成,同日不再撞接口");
+    }
+
+    @Test
+    void dailyCheckinWithoutCookieDoesNothing() {
+        KuafuSearchService service = new KuafuSearchService(
+                settings("https://www.kfzy.net", null), props(), new ObjectMapper()) {
+            @Override
+            protected Resp http(Request request) throws IOException {
+                throw new AssertionError("无 Cookie 不得发任何请求");
+            }
+        };
+        service.dailyCheckin();
+    }
+
+    @Test
+    void checkCredentialLogoutLinkMeansValid() {
+        KuafuSearchService service = new KuafuSearchService(
+                settings("https://www.kfzy.net", null), props(), new ObjectMapper()) {
+            @Override
+            protected Resp http(Request request) {
+                assertEquals("https://kf.example/user.htm", request.url().toString());
+                assertEquals("bbs_sid=s; bbs_token=t", request.header("Cookie"));
+                return new Resp(200, List.of(), "<a href='user-logout.htm'>退出</a> <span>夸父用户</span>");
+            }
+        };
+        SiteCredentialCheckResult result = service.checkCredential(new SiteCredentialCheckRequest("kuafu", "bbs_sid=s; bbs_token=t", "https://kf.example", "", ""));
+        assertEquals("kuafu", result.site());
+        assertTrue(result.valid());
+    }
+
+    @Test
+    void checkCredentialLoginPageMeansInvalid() {
+        KuafuSearchService service = new KuafuSearchService(
+                settings("https://www.kfzy.net", null), props(), new ObjectMapper()) {
+            @Override
+            protected Resp http(Request request) {
+                return new Resp(200, List.of(), "<a href='user-login.htm'>登录</a>");
+            }
+        };
+        SiteCredentialCheckResult result = service.checkCredential(new SiteCredentialCheckRequest("kuafu", "bbs_sid=dead", "https://kf.example", "", ""));
+        assertFalse(result.valid());
+        assertTrue(result.message().contains("未登录"), result.message());
+    }
+
+    @Test
+    void checkCredentialWithoutCookieSendsNothing() {
+        KuafuSearchService service = new KuafuSearchService(
+                settings("https://www.kfzy.net", null), props(), new ObjectMapper()) {
+            @Override
+            protected Resp http(Request request) throws IOException {
+                throw new AssertionError("未填 Cookie 不得发任何请求");
+            }
+        };
+        SiteCredentialCheckResult result = service.checkCredential(new SiteCredentialCheckRequest("kuafu", "", "", "", ""));
+        assertFalse(result.valid());
+        assertEquals("未填写 Cookie", result.message());
     }
 }

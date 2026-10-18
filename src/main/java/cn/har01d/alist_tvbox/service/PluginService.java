@@ -52,6 +52,10 @@ public class PluginService {
     public static final String STATIC_URL_PREFIX = "/static/";
     public static final String FILE_PLUGIN_DIR = "plugins";
     public static final String FILE_PLUGIN_URL_PREFIX = STATIC_URL_PREFIX + FILE_PLUGIN_DIR + "/";
+    // 文件-backed 自定义网页源：static/webhome/pages/ 下的 .html 自动注册为订阅源(csp_WebHome 站点)。
+    // 页面经 /webhome/** 映射访问(带 no-cache,与内置 app.html 同机制),url 身份仍以 /static/ 前缀落库
+    public static final String WEB_PAGE_DIR = "webhome/pages";
+    public static final String WEB_PAGE_URL_PREFIX = STATIC_URL_PREFIX + WEB_PAGE_DIR + "/";
 
     private final PluginRepository pluginRepository;
     private final SettingRepository settingRepository;
@@ -154,6 +158,53 @@ public class PluginService {
         plugin.setLastCheckedAt(OffsetDateTime.now());
         plugin.setLastError("");
         return pluginRepository.save(plugin);
+    }
+
+    /**
+     * 自定义网页源注册(static/webhome/pages/*.html 文件双向同步入口):按 url 匹配 upsert,
+     * 不解析内容、不发起下载;重扫时保留用户改过的名称/开关/顺序,仅新建时用文件名兜底。
+     */
+    @Transactional
+    public Plugin upsertWebPage(String url, String fallbackName) {
+        Plugin existing = pluginRepository.findByUrl(url).orElse(null);
+        if (existing != null) {
+            existing.setLastCheckedAt(OffsetDateTime.now());
+            existing.setLastError("");
+            return pluginRepository.save(existing);
+        }
+        Plugin plugin = new Plugin();
+        plugin.setUrl(url);
+        plugin.setName(StringUtils.defaultIfBlank(fallbackName, deriveSourceName(url)));
+        plugin.setSourceName(plugin.getName());
+        plugin.setEnabled(true);
+        plugin.setSortOrder(subscriptionSourceService.nextSortOrder());
+        plugin.setLastCheckedAt(OffsetDateTime.now());
+        plugin.setLastError("");
+        Plugin saved = pluginRepository.save(plugin);
+        // 新网页源插到插件区最前(内置源之后、其它插件之前),不沉底;重扫已有条目不重排
+        subscriptionSourceService.moveToFrontOfPlugins("plugin-" + saved.getId());
+        return saved;
+    }
+
+    /** 是否为文件-backed 自定义网页源(区别于 spider 插件,站点走 csp_WebHome 形态)。 */
+    public static boolean isWebPagePlugin(Plugin plugin) {
+        return plugin != null && plugin.getUrl() != null && plugin.getUrl().startsWith(WEB_PAGE_URL_PREFIX);
+    }
+
+    /** 网页源站点 key:web_ + 文件路径 sanitized(非 ASCII/特殊字符折叠为 _,空则回落插件 id)。 */
+    public static String webPageSiteKey(Plugin plugin) {
+        String name = StringUtils.removeStart(plugin.getUrl(), WEB_PAGE_URL_PREFIX);
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) {
+            name = name.substring(0, dot);
+        }
+        String key = StringUtils.strip(name.replaceAll("[^A-Za-z0-9_]", "_").replaceAll("_+", "_"), "_");
+        return "web_" + (key.isEmpty() ? String.valueOf(plugin.getId()) : key);
+    }
+
+    /** 网页源页面访问地址:文件身份 /static/webhome/pages/x.html → 访问 /webhome/pages/x.html(no-cache)。 */
+    public static String webPageUrl(Plugin plugin) {
+        return "/webhome/" + StringUtils.removeStart(plugin.getUrl(), STATIC_URL_PREFIX + "webhome/");
     }
 
     @Transactional
@@ -547,7 +598,13 @@ public class PluginService {
 
     private String readFileBackedContent(String url) {
         String relative = StringUtils.removeStart(url, STATIC_URL_PREFIX);
-        Path file = Utils.getWebPath("static").resolve(relative).normalize();
+        Path base = Utils.getWebPath("static");
+        Path file = base.resolve(relative).normalize();
+        // plugin.url 来自 DB,导入外部分享的备份可写入 /static/../../ 形态 —— 目录包含校验,
+        // 否则 refresh + 公开端点 /plugins/{token}/{id}.txt 组成任意文件读外传链
+        if (!file.startsWith(base)) {
+            throw new BadRequestException("插件路径越界: " + relative);
+        }
         try {
             return Files.readString(file);
         } catch (IOException e) {
@@ -573,7 +630,8 @@ public class PluginService {
         } catch (Exception ignored) {
         }
         String raw = source.substring(source.lastIndexOf('/') + 1);
-        String decoded = URLDecoder.decode(raw, StandardCharsets.UTF_8);
+        // URLDecoder 是 query 语义会把 + 解成空格,path 段的 + 是字面字符 —— 先转义保住
+        String decoded = URLDecoder.decode(raw.replace("+", "%2B"), StandardCharsets.UTF_8);
         int dot = decoded.lastIndexOf('.');
         return dot > 0 ? decoded.substring(0, dot) : decoded;
     }
@@ -668,11 +726,14 @@ public class PluginService {
     }
 
     static boolean isPythonPluginUrl(String url) {
+        String trimmed = StringUtils.trimToEmpty(url);
         try {
-            String path = URI.create(StringUtils.trimToEmpty(url)).getPath();
-            return StringUtils.endsWithIgnoreCase(path, ".py");
-        } catch (Exception e) {
-            return false;
+            return StringUtils.endsWithIgnoreCase(URI.create(trimmed).getPath(), ".py");
+        } catch (IllegalArgumentException e) {
+            // 文件名含 []、空格等 URI 非法字符时 URI.create 抛异常(static/plugins/ 扫描出的 url 不编码),
+            // 回退字符串判定:误判 false 会让明文 .py 按加密 .txt 下发,客户端解密失败搜索无结果 (#1081)
+            String path = trimmed.split("[?#]", 2)[0];
+            return StringUtils.endsWithIgnoreCase(path.substring(path.lastIndexOf('/') + 1), ".py");
         }
     }
 

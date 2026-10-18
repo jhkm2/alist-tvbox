@@ -4,6 +4,7 @@ import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.service.MediaSubscriptionService;
 import cn.har01d.alist_tvbox.service.PianDanService;
 import cn.har01d.alist_tvbox.service.SubscriptionService;
+import cn.har01d.alist_tvbox.service.WatchlistService;
 import cn.har01d.alist_tvbox.tvbox.Category;
 import cn.har01d.alist_tvbox.tvbox.CategoryList;
 import cn.har01d.alist_tvbox.tvbox.MovieDetail;
@@ -11,6 +12,7 @@ import cn.har01d.alist_tvbox.tvbox.MovieList;
 import com.qq.tars.common.util.JSON;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.BeanUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -40,31 +42,44 @@ import java.util.Set;
 public class MediaLibraryController {
     /** browse 已占用的保留参数,其余 query 参数透传为片单筛选(TVBox categoryContent extend 同名平铺)。 */
     private static final Set<String> RESERVED_PARAMS = Set.of("id", "t", "pg", "ac", "wd", "title");
+    /** 「稍后再看」分类短 id:必须在此显式分流 —— 未知 tid 落 contentList 后 filterByStatus 的
+     *  default->true 会把它显示成「全部订阅」。 */
+    private static final String WANT_CATEGORY_ID = "want";
 
     private final SubscriptionService subscriptionService;
     private final MediaSubscriptionService mediaSubscriptionService;
     private final PianDanService pianDanService;
+    private final cn.har01d.alist_tvbox.service.WebHomeService webHomeService;
+    private final WatchlistService watchlistService;
 
     public MediaLibraryController(SubscriptionService subscriptionService,
                                   MediaSubscriptionService mediaSubscriptionService,
-                                  PianDanService pianDanService) {
+                                  PianDanService pianDanService,
+                                  cn.har01d.alist_tvbox.service.WebHomeService webHomeService,
+                                  WatchlistService watchlistService) {
         this.subscriptionService = subscriptionService;
         this.mediaSubscriptionService = mediaSubscriptionService;
         this.pianDanService = pianDanService;
+        this.webHomeService = webHomeService;
+        this.watchlistService = watchlistService;
     }
 
     @GetMapping("/media")
     public Object browse(String id, String t, String ac, String wd, String title,
                          @RequestParam(required = false, defaultValue = "1") int pg,
-                         @RequestParam Map<String, String> params) {
-        return browse("", id, t, ac, wd, title, pg, params);
+                         @RequestParam Map<String, String> params,
+                         jakarta.servlet.http.HttpServletRequest request) {
+        return browse("", id, t, ac, wd, title, pg, params, request);
     }
 
     @GetMapping("/media/{token}")
     public Object browse(@PathVariable String token, String id, String t, String ac, String wd, String title,
                          @RequestParam(required = false, defaultValue = "1") int pg,
-                         @RequestParam Map<String, String> params) {
+                         @RequestParam Map<String, String> params,
+                         jakarta.servlet.http.HttpServletRequest request) {
         subscriptionService.checkToken(token);
+        // spider 运行时探测宿主 WebHome 桥接类后随请求上报(X-CLIENT-CAPS);webhtv 独占包名亦可直接判定
+        webHomeService.recordCapability(token, request.getHeader("X-CLIENT-CAPS"), request.getHeader("X-CLIENT"));
         int uid = mediaSubscriptionService.resolveUid(token);
         if (StringUtils.isNotBlank(id)) {
             if (isPianDanId(id)) {
@@ -78,18 +93,43 @@ public class MediaLibraryController {
         if (isPianDanId(t)) {
             return pianDanList(uid, t, pg, params);
         }
+        if (WANT_CATEGORY_ID.equals(t)) {
+            return watchlistContent(uid, pg);
+        }
         if (StringUtils.isNotBlank(t) && !"0".equals(t)) {
             return mediaSubscriptionService.contentList(uid, t, null);
         }
         if (StringUtils.isNotBlank(t)) { // t=0:首页直接展示全部
             return mediaSubscriptionService.contentList(uid);
         }
-        return categories();
+        return categories(uid);
+    }
+
+    /** 「稍后再看」分类列表(t=want):条目 vod_id 为片单形态,封面/「已追」角标与片单列表同口径
+     *  (角标走幂等助手,转订阅后队列条目原地显示已追,用户自行移出或留着)。 */
+    private Object watchlistContent(int uid, int pg) {
+        MovieList result = watchlistService.content(uid, pg);
+        var subscriptions = mediaSubscriptionService.subscriptionsOf(uid);
+        for (MovieDetail item : result.getList()) {
+            item.setVod_pic(mediaSubscriptionService.absoluteClientCover(item.getVod_pic()));
+            item.setVod_remarks(subscribedRemarks(item.getVod_remarks(),
+                    mediaSubscriptionService.isSubscribedTitle(uid, item.getVod_name(), subscriptions)));
+        }
+        return result;
     }
 
     private static boolean isPianDanId(String value) {
         return value != null && (value.startsWith(PianDanService.DOUBAN_PREFIX) || value.startsWith(PianDanService.TMDB_PREFIX)
-                || value.startsWith("s:"));
+                || value.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX) || value.startsWith("s:"));
+    }
+
+    /** db:{纯数字} → 豆瓣 subject id;格式非法 400(与 tmdb 分支同口径)。 */
+    private static int parseDoubanSubjectId(String id) {
+        try {
+            return Integer.parseInt(id.substring(PianDanService.DOUBAN_SUBJECT_PREFIX.length()));
+        } catch (NumberFormatException e) {
+            throw new BadRequestException("无效的片单条目: " + id);
+        }
     }
 
     private Object detail(int uid, String id, String ac, String title) {
@@ -109,17 +149,32 @@ public class MediaLibraryController {
     /** 站内搜索:已订阅命中在前 + 片单 TMDB 全库(multi)在后 —— 没追过的剧/电影也能搜到,
      *  点进详情即片单条目(带「➕ 加入追剧」)。翻页只翻 TMDB 侧(已订阅命中固定在第一页);
      *  TMDB 结果里已追的带「已追」角标(与片单分类列表同口径),封面统一重建客户端可用地址。 */
+    /**
+     * 「已追」角标幂等归一:榜单列表/搜索结果可能是 pianDanService 缓存里的共享 MovieDetail
+     * 对象,直接前缀会跨请求累加(线上:已追 已追 已追…刷新一次多一个)、跨 uid 串标。
+     * 统一先剥净历史「已追」前缀段,再按当次订阅状态至多缀一次;回写归一值,重复请求幂等。
+     */
+    static String subscribedRemarks(String remarks, boolean subscribed) {
+        String base = StringUtils.defaultString(remarks).trim();
+        while (base.equals("已追") || base.startsWith("已追 ")) {
+            base = base.equals("已追") ? "" : base.substring("已追 ".length()).trim();
+        }
+        if (!subscribed) return base;
+        return base.isEmpty() ? "已追" : "已追 " + base;
+    }
+
     private MovieList searchAll(int uid, String wd, int pg) {
         List<MovieDetail> merged = new ArrayList<>();
         if (pg <= 1) {
             merged.addAll(mediaSubscriptionService.contentList(uid, null, wd).getList());
         }
         MovieList tmdb = pianDanService.search(wd, pg, 24);
+        // 「已追」匹配用订阅快照:逐条调单参版每条都是一次订阅表全量拉取
+        var subscriptions = mediaSubscriptionService.subscriptionsOf(uid);
         for (MovieDetail item : tmdb.getList()) {
             item.setVod_pic(mediaSubscriptionService.absoluteClientCover(item.getVod_pic()));
-            if (mediaSubscriptionService.isSubscribedTitle(uid, item.getVod_name())) {
-                item.setVod_remarks("已追 " + StringUtils.defaultString(item.getVod_remarks()));
-            }
+            item.setVod_remarks(subscribedRemarks(item.getVod_remarks(),
+                    mediaSubscriptionService.isSubscribedTitle(uid, item.getVod_name(), subscriptions)));
             merged.add(item);
         }
         MovieList result = new MovieList();
@@ -131,7 +186,8 @@ public class MediaLibraryController {
         return result;
     }
 
-    /** 片单分类条目列表:ac=web 走豆瓣封面代理,再统一重建客户端可用绝对地址;已订阅条目带「已追」角标。 */
+    /** 片单分类条目列表:ac=web 走豆瓣封面代理,再统一重建客户端可用绝对地址;已订阅条目带「已追」角标。
+     *  列表对象可能是 pianDanService 缓存里的共享 MovieDetail(pic 重建依赖当次请求 host),拷贝后再改写,防首请求者的 host 烤进缓存。 */
     private Object pianDanList(int uid, String type, int pg, Map<String, String> params) {
         Map<String, String> filters = new java.util.HashMap<>();
         params.forEach((key, value) -> {
@@ -140,12 +196,16 @@ public class MediaLibraryController {
             }
         });
         MovieList result = pianDanService.list(type, "web", pg, 24, filters);
+        List<MovieDetail> items = new ArrayList<>();
+        var subscriptions = mediaSubscriptionService.subscriptionsOf(uid);
         for (MovieDetail item : result.getList()) {
-            item.setVod_pic(mediaSubscriptionService.absoluteClientCover(item.getVod_pic()));
-            if (mediaSubscriptionService.isSubscribedTitle(uid, item.getVod_name())) {
-                item.setVod_remarks("已追 " + StringUtils.defaultString(item.getVod_remarks()));
-            }
+            MovieDetail copy = copyDetail(item);
+            copy.setVod_pic(mediaSubscriptionService.absoluteClientCover(copy.getVod_pic()));
+            copy.setVod_remarks(subscribedRemarks(copy.getVod_remarks(),
+                    mediaSubscriptionService.isSubscribedTitle(uid, copy.getVod_name(), subscriptions)));
+            items.add(copy);
         }
+        result.setList(items);
         return result;
     }
 
@@ -156,15 +216,7 @@ public class MediaLibraryController {
             return null;
         }
         MovieDetail copy = new MovieDetail();
-        copy.setVod_id(source.getVod_id());
-        copy.setVod_name(source.getVod_name());
-        copy.setVod_pic(source.getVod_pic());
-        copy.setVod_year(source.getVod_year());
-        copy.setVod_actor(source.getVod_actor());
-        copy.setVod_content(source.getVod_content());
-        copy.setType_name(source.getType_name());
-        copy.setVod_remarks(source.getVod_remarks());
-        copy.setExt(source.getExt());
+        BeanUtils.copyProperties(source, copy);
         return copy;
     }
 
@@ -183,8 +235,19 @@ public class MediaLibraryController {
             if (detail == null) {
                 throw new BadRequestException("片单条目信息获取失败: " + id);
             }
+        } else if (id.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX)) {
+            // db:{豆瓣id}:本地库 id 直取,未收录的榜单新片回落 rexxar 在线解析(命中短缓存实例,拷贝防污染)
+            int doubanId = parseDoubanSubjectId(id);
+            detail = mediaSubscriptionService.localDoubanDetailById(doubanId);
+            if (detail == null) {
+                detail = copyDetail(pianDanService.doubanSubjectDetail(doubanId));
+            }
+            if (detail == null) {
+                throw new BadRequestException("片单条目信息获取失败: " + id);
+            }
+            detail.setVod_id(id);
         } else if (id.startsWith("s:")) {
-            // 豆瓣片单条目无 subject id:名称(+vod_id 内嵌年份)在本地豆瓣库严格唯一匹配,命中返回富详情
+            // 豆瓣片单条目无 subject id 的兜底形态:名称(+vod_id 内嵌年份)在本地豆瓣库严格唯一匹配,命中返回富详情
             PianDanService.NameYear entry = PianDanService.parseSubjectId(id);
             detail = mediaSubscriptionService.localDoubanDetail(entry.name(), entry.year());
             if (detail == null) {
@@ -201,9 +264,7 @@ public class MediaLibraryController {
         }
         boolean subscribed = mediaSubscriptionService.isSubscribedTitle(uid, detail.getVod_name());
         detail.setVod_pic(mediaSubscriptionService.absoluteClientCover(detail.getVod_pic()));
-        if (subscribed) {
-            detail.setVod_remarks("已追 " + StringUtils.defaultString(detail.getVod_remarks()));
-        }
+        detail.setVod_remarks(subscribedRemarks(detail.getVod_remarks(), subscribed));
         detail.setVod_play_from("片单");
         // 爬虫端拼 GET 参数不编码,标题里的空格/&/# 会截断请求 —— vodId 先按 form 编码;
         // OkHttp/服务端各解一次百分号序列后,PlayController 收到的即是原始 vodId。
@@ -213,11 +274,20 @@ public class MediaLibraryController {
         String encoded = java.net.URLEncoder.encode(payload, java.nio.charset.StandardCharsets.UTF_8);
         StringBuilder playUrl = new StringBuilder("📄 媒体信息$")
                 .append(MediaSubscriptionService.INFO_PLAY_PREFIX).append(encoded)
-                // 全局搜索:spider 本地拦截跳播放器搜索页(FongMi 系带 keyword 启动即全站自动搜),
-                // 载荷仅剧名,等价片单导航源的跳搜玩法,让片单条目无需切站即可全网找片
+                // 全局搜索:spider 本地拦截跳播放器搜索(优先 CollectActivity 带 keyword 启动即
+                // 全站聚合搜,OK影视 TV 的 SearchActivity 不读 extra 会丢词),载荷仅剧名,
+                // 等价片单导航源的跳搜玩法,让片单条目无需切站即可全网找片
                 .append("#🔍 全局搜索$")
                 .append(MediaSubscriptionService.SEARCH_PLAY_PREFIX)
                 .append(java.net.URLEncoder.encode(detail.getVod_name(), java.nio.charset.StandardCharsets.UTF_8));
+        // 稍后再看:按钮文案即状态(已在队列=移出),载荷与加入追剧同款 {vodId}|{剧名}
+        if (watchlistService.exists(uid, id)) {
+            playUrl.append("#➖ 移出稍后再看$")
+                    .append(MediaSubscriptionService.WATCH_DEL_PLAY_PREFIX).append(encoded);
+        } else {
+            playUrl.append("#➕ 稍后再看$")
+                    .append(MediaSubscriptionService.WATCH_ADD_PLAY_PREFIX).append(encoded);
+        }
         if (detail.getExt() instanceof List<?> seasons && !seasons.isEmpty()) {
             // 多季剧按季展开:每季一条目(已追季为取消项),单点直达「追剧·第5季」
             for (Object season : seasons) {
@@ -250,10 +320,14 @@ public class MediaLibraryController {
         return result;
     }
 
-    private CategoryList categories() {
+    private CategoryList categories(int uid) {
         CategoryList result = new CategoryList();
         List<Category> categories = new ArrayList<>();
         categories.add(category("recent", "最近更新"));
+        // 稍后再看:用户级想看队列,空则不出分类(新用户首屏不被空分类占位)
+        if (watchlistService.count(uid) > 0) {
+            categories.add(category(WANT_CATEGORY_ID, "稍后再看"));
+        }
         categories.add(category("active", "连载中"));
         categories.add(category("ended", "已完结"));
         categories.add(category("all", "全部订阅"));

@@ -15,6 +15,7 @@ import cn.har01d.alist_tvbox.entity.MediaSubscription;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisode;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeRepository;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeSource;
+import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEvent;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionEventRepository;
 import cn.har01d.alist_tvbox.entity.MediaSubscriptionRepository;
@@ -44,6 +45,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +71,16 @@ public class MediaSubscriptionService {
     /** 订阅操作线路伪播放 id 前缀:msubstat-{subId}(订阅信息)/ msubcheck-{subId}(轻量检查更新)/
      *  msubinspect-{subId}(完整巡检,异步)/ msubunsub-{subId}(取消追剧),均 msg 回执。 */
     public static final String STAT_PLAY_PREFIX = "msubstat-";
+
+    private static final String[] WEEKDAYS = {"周一", "周二", "周三", "周四", "周五", "周六", "周日"};
+
+    /** 播出时间文案「MM-dd 周X HH:mm」(北京时间):欧美剧/追番多为周播,周几才是更新心智锚点,裸日期难对应。 */
+    static String airTimeText(long epochMilli) {
+        java.time.ZonedDateTime time = java.time.Instant.ofEpochMilli(epochMilli)
+                .atZone(java.time.ZoneId.of(Constants.ZONE_ID));
+        return String.format("%02d-%02d %s %02d:%02d", time.getMonthValue(), time.getDayOfMonth(),
+                WEEKDAYS[time.getDayOfWeek().getValue() - 1], time.getHour(), time.getMinute());
+    }
     public static final String CHECK_PLAY_PREFIX = "msubcheck-";
     public static final String INSPECT_PLAY_PREFIX = "msubinspect-";
     public static final String UNSUBSCRIBE_SUB_PLAY_PREFIX = "msubunsub-";
@@ -78,6 +90,10 @@ public class MediaSubscriptionService {
     /** 片单条目「全局搜索」伪播放 id 前缀:msubsearch-{剧名}。spider 端本地拦截跳播放器搜索页
      *  (FongMi 系 SearchActivity 带 keyword extra 启动即对全部站点自动搜索),不请求后端。 */
     public static final String SEARCH_PLAY_PREFIX = "msubsearch-";
+    /** 片单条目「稍后再看」伪播放 id 前缀:watchadd-{vodId}|{剧名} / watchdel- 同载荷。
+     *  与 msubadd- 同构(后端 msg 回执,spider 零改动);载荷解析复用 pianDanEntry。 */
+    public static final String WATCH_ADD_PLAY_PREFIX = "watchadd-";
+    public static final String WATCH_DEL_PLAY_PREFIX = "watchdel-";
     /** TVBox 分集标题美化开关(Setting,默认关):剧集列表显示「集数. 分集标题(大小)」替代文件名 */
     public static final String SETTING_EPISODE_TITLES = "msub_episode_titles";
     /** 资源侧"可播集"状态口径:列目录见过(LISTED)或取链成功过(VERIFIED)的集源行 —— 详情装配与角标同源。 */
@@ -105,6 +121,7 @@ public class MediaSubscriptionService {
     private final ObjectMapper objectMapper;
     private final ProxyService proxyService;
     private final cn.har01d.alist_tvbox.entity.SiteRepository siteRepository;
+    private final cn.har01d.alist_tvbox.service.sitesearch.EpisodeFallbackService episodeFallbackService;
 
     public MediaSubscriptionService(MediaSubscriptionRepository subscriptionRepository,
                                     MediaSubscriptionResourceRepository resourceRepository,
@@ -123,7 +140,8 @@ public class MediaSubscriptionService {
                                     AppProperties appProperties,
                                     ObjectMapper objectMapper,
                                     ProxyService proxyService,
-                                    cn.har01d.alist_tvbox.entity.SiteRepository siteRepository) {
+                                    cn.har01d.alist_tvbox.entity.SiteRepository siteRepository,
+                                    cn.har01d.alist_tvbox.service.sitesearch.EpisodeFallbackService episodeFallbackService) {
         this.subscriptionRepository = subscriptionRepository;
         this.resourceRepository = resourceRepository;
         this.eventRepository = eventRepository;
@@ -142,6 +160,7 @@ public class MediaSubscriptionService {
         this.objectMapper = objectMapper;
         this.proxyService = proxyService;
         this.siteRepository = siteRepository;
+        this.episodeFallbackService = episodeFallbackService;
     }
 
     /** 订阅 token → 归属用户:凭证形态(u-{username}-{secret})验真或裸 u-{username} → 该用户;
@@ -179,7 +198,9 @@ public class MediaSubscriptionService {
                 checkService.prewarmCoverAsync(subscription);
             }
         }
-        return subscriptions.stream().map(this::toDto).toList();
+        // 批量装配:逐订阅 toDto 是每条 4-6 次查询+Setting 读(百级订阅=单请求数百查询),一次 IN 预取按订阅分组
+        ListBatchContext ctx = loadBatchContext(subscriptions);
+        return subscriptions.stream().map(s -> toDto(s, ctx)).toList();
     }
 
     @Transactional
@@ -230,9 +251,13 @@ public class MediaSubscriptionService {
         // 磁力兜底仅转存模式可用:离线产物落全局离线配置账号,挂载模式无资源沉淀语义
         subscription.setMagnetOffline(MediaSubscription.MODE_TRANSFER.equals(subscription.getMode())
                 && request.getMagnetOffline() != null && request.getMagnetOffline());
+        // 115 自有分享仅挂载模式可用(与转存互斥:转存副本已达成同等稳定性,且共享转存目录会互相踩)
+        subscription.setSelfShare(MediaSubscription.MODE_FOLLOW.equals(subscription.getMode())
+                && request.getSelfShare() != null && request.getSelfShare());
         subscription.setCheckIntervalHours(request.getCheckIntervalHours() != null && request.getCheckIntervalHours() > 0
                 ? request.getCheckIntervalHours() : appProperties.getSubscription().getCheckIntervalHours());
         subscription.setCustomAirClock(requireAirClock(request.getCustomAirClock()));
+        subscription.setAirWeekdays(serializeAirWeekdays(request.getAirWeekdays()));
         subscription.setFilterConfig(serializeFilter(resolveFilter(uid, request.getFilter())));
         subscription.setMainDrives(serializeMainDrives(request.getMainDrives()));
         subscription.setStatus(MediaSubscription.STATUS_ACTIVE);
@@ -314,6 +339,10 @@ public class MediaSubscriptionService {
             if (!MediaSubscription.MODE_TRANSFER.equals(subscription.getMode())) {
                 subscription.setMagnetOffline(false);
             }
+            // 115 自有分享仅挂载模式:切出 FOLLOW 时同步关闭,防孤儿开关(selfShare 未随请求携带时)
+            if (!MediaSubscription.MODE_FOLLOW.equals(subscription.getMode())) {
+                subscription.setSelfShare(false);
+            }
         }
         if (request.getAccountId() != null) {
             subscription.setAccountId(request.getAccountId());
@@ -329,6 +358,11 @@ public class MediaSubscriptionService {
             subscription.setMagnetOffline(MediaSubscription.MODE_TRANSFER.equals(subscription.getMode())
                     && request.getMagnetOffline());
         }
+        if (request.getSelfShare() != null) {
+            // 同上:非挂载模式静默回落 false
+            subscription.setSelfShare(MediaSubscription.MODE_FOLLOW.equals(subscription.getMode())
+                    && request.getSelfShare());
+        }
         if (request.getCheckIntervalHours() != null && request.getCheckIntervalHours() > 0) {
             subscription.setCheckIntervalHours(request.getCheckIntervalHours());
         }
@@ -336,6 +370,11 @@ public class MediaSubscriptionService {
             subscription.setCustomAirClock(requireAirClock(request.getCustomAirClock()));
             // 立即重放改写 schedule/nextAirTime(元数据刷新 24h 节流,等下轮太迟)并按新时刻重排
             checkService.applyCustomAirClock(subscription);
+            checkService.scheduleNext(subscription);
+        }
+        if (request.getAirWeekdays() != null) {
+            // 更新日变更(空列表 = 清除,回归官方日程/常规调度):立即重排,下一个更新日 20:15 起查
+            subscription.setAirWeekdays(serializeAirWeekdays(request.getAirWeekdays()));
             checkService.scheduleNext(subscription);
         }
         if (request.getFilter() != null) {
@@ -458,6 +497,7 @@ public class MediaSubscriptionService {
         List<Integer> resourceIds = resources.stream().map(MediaSubscriptionResource::getId).toList();
         episodeSourceRepository.deleteByResourceIdIn(resourceIds);
         episodeRepository.deleteBySubscriptionId(id);
+        episodeFallbackService.deleteForSubscription(id); // 兜底覆盖层行 + 负缓存等内存态随行清理
         resourceRepository.deleteBySubscriptionId(id);
         eventRepository.deleteBySubscriptionId(id);
         subscriptionRepository.deleteById(id);
@@ -528,7 +568,7 @@ public class MediaSubscriptionService {
      * (手动事实优先于既有判定,restoreResource 同款语义)。
      */
     public Map<String, Object> addResource(int uid, int id, String link, String password) {
-        getOwned(uid, id);
+        MediaSubscription subscription = getOwned(uid, id);
         String normalized = StringUtils.trimToEmpty(link);
         if (StringUtils.isBlank(normalized)) {
             throw new BadRequestException("缺少分享链接");
@@ -536,6 +576,10 @@ public class MediaSubscriptionService {
         normalized = StringUtils.abbreviate(normalized, 1000); // 列 VARCHAR(1024)
         cn.har01d.alist_tvbox.entity.Share probe = shareService.parseShareLink(normalized);
         if (probe == null || probe.getType() == null || !MediaSubscriptionCheckService.supportedDriveType(probe.getType())) {
+            String mountedPath = mountedPathOf(normalized);
+            if (mountedPath != null) {
+                return addPathResource(subscription, mountedPath);
+            }
             throw new BadRequestException("无法识别的网盘分享链接(支持夸克/UC/阿里/百度/115/天翼/移动/123/迅雷/光鸭)");
         }
         MediaSubscriptionResource resource =
@@ -575,6 +619,85 @@ public class MediaSubscriptionService {
         log.info("media subscription {} manually added resource candidate {} (existed={}, revived={})",
                 id, resource.getId(), existed, revived);
         return Map.of("success", true, "resourceId", resource.getId(), "existed", existed, "revived", revived);
+    }
+
+    /** 输入形态识别:本实例 URL(http://host:port/…)或裸路径(/…)视为已挂载网盘目录,返回规范化
+     *  AList 路径;其余返回 null(走分享链接流程)。URL 形态按需解码(%XX),WebDAV 前缀 /dav 剥离。 */
+    private static String mountedPathOf(String raw) {
+        String value = StringUtils.trimToEmpty(raw);
+        boolean url = StringUtils.startsWithIgnoreCase(value, "http://")
+                || StringUtils.startsWithIgnoreCase(value, "https://");
+        if (!url && !value.startsWith("/")) {
+            return null;
+        }
+        String path = value;
+        if (url) {
+            try {
+                path = java.net.URI.create(value).getRawPath();
+            } catch (Exception e) {
+                return null;
+            }
+            if (path != null && path.contains("%")) {
+                try {
+                    path = java.net.URLDecoder.decode(path, java.nio.charset.StandardCharsets.UTF_8);
+                } catch (IllegalArgumentException e) {
+                    // 字面 % 序列(目录名本身含 %):保留原文
+                }
+            }
+        }
+        path = path == null ? "" : path.replaceAll("/+", "/");
+        if (path.startsWith("/dav/") || "/dav".equals(path)) { // WebDAV 前缀:fs 路径空间无 /dav
+            path = path.substring(4);
+        }
+        while (path.endsWith("/") && path.length() > 1) {
+            path = path.substring(0, path.length() - 1);
+        }
+        if (StringUtils.isBlank(path) || "/".equals(path)) {
+            throw new BadRequestException("请粘贴具体的剧集目录(如 /115/115/电影/XXX)");
+        }
+        if (path.length() > 500) { // mount_path VARCHAR(512)
+            throw new BadRequestException("路径过长:" + StringUtils.abbreviate(path, 80));
+        }
+        return path;
+    }
+
+    /** 手动添加已挂载网盘目录(issue #1071):即时列举入账为路径资源(path: 合成链接,直接供流
+     *  不挂卸不动主源);入账失败抛 400 把原因回给用户;目录原位增长由巡检 refreshAuxMounts 每轮重列承接。 */
+    private Map<String, Object> addPathResource(MediaSubscription subscription, String path) {
+        if (path.equals(subscription.getMountPath())) {
+            throw new BadRequestException("该路径正是本订阅的主源挂载目录,无需添加");
+        }
+        String link = "path:" + path;
+        MediaSubscriptionResource resource =
+                resourceRepository.findBySubscriptionIdAndLink(subscription.getId(), link).orElse(null);
+        boolean existed = resource != null;
+        boolean revived = false;
+        if (resource == null) {
+            resource = new MediaSubscriptionResource();
+            resource.setSubscriptionId(subscription.getId());
+            resource.setLink(link);
+            resource.setCreatedTime(System.currentTimeMillis());
+        } else if (MediaSubscriptionResource.STATE_CANDIDATE.equals(resource.getState())
+                || MediaSubscriptionResource.STATE_MOUNTED.equals(resource.getState())) {
+            // 幂等:已入账,重新添加 = 刷新目录内容(原位增长的手动同步入口)
+        } else {
+            revived = true; // REMOVED/RETIRED/REJECTED:手动事实优先,重新入账复活(restoreResource 同款)
+        }
+        resource.setType(DriveId.fromDriverName(shareService.findStorageDriverByPath(path)));
+        resource.setSource(MediaSubscriptionResource.SOURCE_MANUAL);
+        resource.setPassword(null);
+        resource.setTitle(StringUtils.abbreviate(StringUtils.substringAfterLast(path, "/"), 250));
+        resource.setScore(1000); // 手动提供的源:线路装配/资源序与手动分享同档置顶
+        Set<Integer> covered;
+        try {
+            covered = checkService.registerPathResource(subscription, resource);
+        } catch (Exception e) {
+            throw new BadRequestException(StringUtils.defaultIfBlank(e.getMessage(), "路径资源入账失败"), e);
+        }
+        log.info("media subscription {} manually added path resource {} at {} ({} episodes, existed={}, revived={})",
+                subscription.getId(), resource.getId(), path, covered.size(), existed, revived);
+        return Map.of("success", true, "resourceId", resource.getId(), "existed", existed,
+                "revived", revived, "episodes", covered.size());
     }
 
     /** 资源池事件(不发通知):手动添加/恢复这类管理动作只进页面时间线。 */
@@ -625,6 +748,7 @@ public class MediaSubscriptionService {
                     && subscription.getMountPath() != null && subscription.getMountPath().equals(r.getMountPath()));
             dto.setPinned(Boolean.TRUE.equals(r.getPinned()));
             dto.setStartEpisode(r.getStartEpisode());
+            dto.setFailKind(r.getFailKind());
             dto.setCheckedTime(r.getCheckedTime());
             dto.setCreatedTime(r.getCreatedTime());
             return dto;
@@ -707,9 +831,20 @@ public class MediaSubscriptionService {
      *  匹配口径与 localDoubanId 一致(年份过滤优先、纯名唯一兜底)。 */
     public MovieDetail localDoubanDetail(String name, Integer year) {
         Movie movie = uniqueLocalMovie(name, year);
-        if (movie == null) {
+        return movie == null ? null : toDoubanDetail(movie);
+    }
+
+    /** 豆瓣 subject id 条目(db:{id})详情富化:本地库按 id 直取 —— 两个 id 同为豆瓣 subject 命名空间,
+     *  findById 命中即该条目,无名称消歧问题;未收录(榜单新片)返回 null 由调用方回落在线解析。 */
+    public MovieDetail localDoubanDetailById(Integer doubanId) {
+        if (doubanId == null) {
             return null;
         }
+        Movie movie = movieRepository.findById(doubanId).orElse(null);
+        return movie == null ? null : toDoubanDetail(movie);
+    }
+
+    private MovieDetail toDoubanDetail(Movie movie) {
         MovieDetail detail = new MovieDetail();
         detail.setVod_name(movie.getName());
         detail.setVod_pic(movie.getCover());
@@ -767,10 +902,20 @@ public class MediaSubscriptionService {
         return null;
     }
 
+    /** 用户全部订阅(创建时间倒序):控制器/批量判定每请求取一次快照,避免逐条全量拉取。 */
+    public List<MediaSubscription> subscriptionsOf(int uid) {
+        return subscriptionRepository.findByUidOrderByCreatedTimeDesc(uid);
+    }
+
     /** 片单条目是否已在追:标题语义匹配(「末日地堡 第三季」命中 web 订的「末日地堡」S3)。 */
     public boolean isSubscribedTitle(int uid, String title) {
+        return isSubscribedTitle(uid, title, subscriptionRepository.findByUidOrderByCreatedTimeDesc(uid));
+    }
+
+    /** 批量判定:列表/搜索每页 24 条逐条调单参版会 24 次全量拉订阅表 —— 取一次快照逐条匹配。 */
+    public boolean isSubscribedTitle(int uid, String title, List<MediaSubscription> subscriptions) {
         String bareName = TextUtils.stripSeasonSuffix(title);
-        return subscriptionRepository.findByUidOrderByCreatedTimeDesc(uid).stream()
+        return subscriptions.stream()
                 .anyMatch(s -> matchesTitle(s, bareName, TextUtils.parseTitleSeason(title)));
     }
 
@@ -813,6 +958,13 @@ public class MediaSubscriptionService {
         if (StringUtils.isBlank(stored)) {
             return stored;
         }
+        /* 防递归:已是绝对 /images 代理形态不再包一层。listCache 缓存的列表条目是共享实例,
+         * 调用方逐次 setVod_pic(absoluteCover(...)) 会把已代理地址再包一层
+         * (/images?url=/images?url=… N 层嵌套,图床侧 400),先短路已代理形态;
+         * 相对形态 "/images?..." 仍需走下方按请求 host 重建绝对地址。 */
+        if (stored.startsWith("http") && stored.contains("/images?url=")) {
+            return stored;
+        }
         if (stored.startsWith("http")) {
             stored = proxiedCover(stored);
         }
@@ -825,9 +977,8 @@ public class MediaSubscriptionService {
                 return stored;
             }
             String query = stored.substring(queryAt + 1);
-            boolean https = appProperties.isEnableHttps() && !cn.har01d.alist_tvbox.util.Utils.isLocalAddress();
             return org.springframework.web.servlet.support.ServletUriComponentsBuilder.fromCurrentRequest()
-                    .scheme(https ? "https" : "http")
+                    .scheme(cn.har01d.alist_tvbox.util.Utils.publicScheme(appProperties.isEnableHttps()))
                     .replacePath("/images")
                     .replaceQuery(query)
                     .build()
@@ -842,15 +993,27 @@ public class MediaSubscriptionService {
      * TVBox 请求(空 ac)走集源行索引直装配(见 {@link #fastDetail});web/TG(非空 ac)与快路径兜底走旧实时列举。 */
     public MovieList contentDetail(int uid, int id, String ac, String title) {
         MediaSubscription subscription = getOwned(uid, id);
-        if (StringUtils.isBlank(subscription.getMountPath()) || subscription.getShareId() == null) {
-            MovieList result = new MovieList();
-            MovieDetail detail = new MovieDetail();
-            applySubscriptionMetadata(detail, subscription);
-            detail.setVod_remarks("尚未找到可用资源");
-            result.getList().add(detail);
-            result.setTotal(1);
-            result.setLimit(1);
-            return result;
+        boolean primaryMounted = StringUtils.isNotBlank(subscription.getMountPath())
+                && subscription.getShareId() != null;
+        if (!primaryMounted) {
+            // 零主源订阅:占位闸门只挡「连一条挂载线路都没有」的真空形态 —— 手动路径资源/补缺挂载
+            // 的集源行同样能装配详情,此前无条件占位把可用行全挡在门外(#1071 线上反馈:全新豆瓣
+            // 订阅加了网盘目录,app 仍「尚未找到可用资源」)。旧路径列举需要主挂载路径,零主源
+            // 只有快路径一条路,装配不出内容(行全失效)再回落占位。
+            boolean hasMountedLine = resourceRepository.findBySubscriptionIdOrderByScoreDesc(id).stream()
+                    .anyMatch(r -> MediaSubscriptionResource.STATE_MOUNTED.equals(r.getState())
+                            && StringUtils.isNotBlank(r.getMountPath()));
+            if (hasMountedLine) {
+                try {
+                    MovieList fast = fastDetail(subscription);
+                    if (fast != null) {
+                        return fast;
+                    }
+                } catch (Exception e) {
+                    log.debug("fast detail for subscription {} failed: {}", id, e.getMessage());
+                }
+            }
+            return noResourceDetail(subscription);
         }
         if (StringUtils.isBlank(ac)) {
             try {
@@ -863,6 +1026,18 @@ public class MediaSubscriptionService {
             }
         }
         return legacyDetail(subscription, ac, title);
+    }
+
+    /** 无可用资源占位详情:零主源且无挂载线路(真空订阅)/快路径装配不出内容时的兜底展示。 */
+    private MovieList noResourceDetail(MediaSubscription subscription) {
+        MovieList result = new MovieList();
+        MovieDetail detail = new MovieDetail();
+        applySubscriptionMetadata(detail, subscription);
+        detail.setVod_remarks("尚未找到可用资源");
+        result.getList().add(detail);
+        result.setTotal(1);
+        result.setLimit(1);
+        return result;
     }
 
     /** 快路径详情:集源行索引直装配,零目录列举 —— 旧路径要对 主挂载/每转存目标/每补缺挂载(上限 6)各做
@@ -934,10 +1109,29 @@ public class MediaSubscriptionService {
             merged.put(episode, logicalEpisodeTitle(episode, titles.get(episode), sizeByEpisode.get(episode))
                     + "$msubep-" + id + '-' + episode);
         }
+        // 采集源兜底覆盖层并入:已垫底的缺集进逻辑线路可点可播(msubep 播放期走覆盖层快路径),
+        // 真源恢复后 putIfAbsent 让位 —— 覆盖层只补洞,不覆盖真源条目(裸实例测试可注入 null,同 CheckService 守卫)
+        List<cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeFallback> overlayRows =
+                episodeFallbackService == null ? List.of() : episodeFallbackService.activeRows(id);
+        for (cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeFallback row : overlayRows) {
+            if (row.getEpisode() <= 0) {
+                continue;
+            }
+            merged.putIfAbsent(row.getEpisode(), logicalEpisodeTitle(row.getEpisode(), titles.get(row.getEpisode()), 0)
+                    + "$msubep-" + id + '-' + row.getEpisode());
+        }
         if (merged.isEmpty()) {
             return null;
         }
         rewriteEpisodeTitles(subscription, merged, driveLines);
+        // 缺集占位(与巡检 computeMissing/网页缺集同口径,不受采集兜底开关影响):缺失集在逻辑线路
+        // 可见可点 —— 兜底开着则播放期同步救活,关着则如实报「暂无可用播放源」,不再整集隐身。
+        // 放在 rewriteEpisodeTitles 之后:标题改写器会重建条目文本,(缺源)标记不能被改掉;
+        // putIfAbsent 让真源/覆盖层条目优先,占位只补洞。
+        for (Integer episode : missingEpisodes(subscription)) {
+            merged.putIfAbsent(episode,
+                    logicalEpisodeTitle(episode, titles.get(episode), 0) + "(缺源)$msubep-" + id + '-' + episode);
+        }
         String[] lines = buildTvBoxPlayLines(id, merged, driveLines, Set.copyOf(checkService.mainDrives(subscription)));
         appendActionLine(lines, id);
         MovieDetail detail = new MovieDetail();
@@ -1092,7 +1286,19 @@ public class MediaSubscriptionService {
                         + (StringUtils.isBlank(detail.getVod_content()) ? "" : "\n" + detail.getVod_content()));
             }
         }
+        // 下集播出置顶(评分行之上,完结剧无此行评分自然回顶):欧美剧/追番周播,「周六 04:00」一眼对上更新日
+        if (hasNextAir(subscription)) {
+            String line = "📅 下集播出:" + airTimeText(subscription.getNextAirTime());
+            detail.setVod_content(StringUtils.isBlank(detail.getVod_content())
+                    ? line : line + "\n" + detail.getVod_content());
+        }
         detail.setVod_remarks(remarks);
+    }
+
+    /** 有下集播出可展示:nextAirTime 非空且订阅未完结(暂停剧仍在播,播出信息照示)。 */
+    private static boolean hasNextAir(MediaSubscription subscription) {
+        return subscription.getNextAirTime() != null
+                && !MediaSubscription.STATUS_ENDED.equals(subscription.getStatus());
     }
 
     /** 订阅元数据快照(持久层零网络);无 provider/metaId 或读取失败返回 null。 */
@@ -1395,7 +1601,6 @@ public class MediaSubscriptionService {
     public List<Map<String, Object>> schedule(int uid) {
         java.time.ZoneId zone = java.time.ZoneId.of(Constants.ZONE_ID);
         java.time.LocalDate startDate = java.time.LocalDate.now(zone).minusDays(1);
-        String[] weekdays = {"周一", "周二", "周三", "周四", "周五", "周六", "周日"};
         List<Map<String, Object>> days = new ArrayList<>();
         List<List<Map<String, Object>>> dayItems = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
@@ -1404,7 +1609,7 @@ public class MediaSubscriptionService {
                 case 0 -> "昨天";
                 case 1 -> "今天";
                 case 2 -> "明天";
-                default -> weekdays[date.getDayOfWeek().getValue() - 1];
+                default -> WEEKDAYS[date.getDayOfWeek().getValue() - 1];
             };
             Map<String, Object> day = new LinkedHashMap<>();
             day.put("label", label);
@@ -1511,7 +1716,7 @@ public class MediaSubscriptionService {
         return String.join(",", parts);
     }
 
-    /** 粘贴链接解析:豆瓣 subject / TMDB tv(含 season) / Bangumi subject / 腾讯 cover /
+    /** 粘贴链接解析:豆瓣 subject / TMDB tv(含 season)/ TMDB movie / Bangumi subject / 腾讯 cover /
      *  B站番剧播放页(ss/ep)/ 优酷 / 爱奇艺剧集页 → 元数据绑定信息。 */
     public Map<String, Object> resolveMetaLink(String url) {
         Map<String, Object> result = new java.util.LinkedHashMap<>();
@@ -1524,7 +1729,11 @@ public class MediaSubscriptionService {
             result.put("provider", "douban");
             result.put("id", matcher.group(1));
             result.put("doubanId", Integer.parseInt(matcher.group(1)));
-        } else if ((matcher = java.util.regex.Pattern.compile("themoviedb\\.org/(?:tv|movie)/(\\d+)").matcher(link)).find()) {
+        } else if ((matcher = java.util.regex.Pattern.compile("themoviedb\\.org/movie/(\\d+)").matcher(link)).find()) {
+            // 电影链接:metaId 带 movie: 前缀(tv/movie 两个命名空间,provider 按前缀走 /3/movie)
+            result.put("provider", "tmdb");
+            result.put("id", cn.har01d.alist_tvbox.service.metadata.TmdbMetadataProvider.MOVIE_ID_PREFIX + matcher.group(1));
+        } else if ((matcher = java.util.regex.Pattern.compile("themoviedb\\.org/tv/(\\d+)").matcher(link)).find()) {
             result.put("provider", "tmdb");
             result.put("id", matcher.group(1));
             java.util.regex.Matcher season = java.util.regex.Pattern.compile("/season/(\\d+)").matcher(link);
@@ -1596,7 +1805,7 @@ public class MediaSubscriptionService {
     }
 
     /** web 端展示用封面走后端代理;/images 为 GET permitAll,浏览器直链可用。TVBox 端保持绝对地址。 */
-    private String proxiedCover(String cover) {
+    public String proxiedCover(String cover) {
         if (StringUtils.isBlank(cover) || !cover.startsWith("http")) {
             return cover;
         }
@@ -1650,6 +1859,7 @@ public class MediaSubscriptionService {
             try {
                 Map<String, Object> result = tvBoxService.getPlayUrl(1, file.dir() + "/" + file.name(), getSub, client, type);
                 kickPreheatAhead(uid, subscriptionId, episode);
+                kickCollectionFallback(uid, subscriptionId, episode);
                 return result;
             } catch (Exception e) {
                 log.info("subscription {} episode {} via {} failed: {}", subscriptionId, episode, file.dir(), e.getMessage());
@@ -1666,12 +1876,26 @@ public class MediaSubscriptionService {
                 Map<String, Object> result = tvBoxService.getPlayUrl(1, path, getSub, client, type);
                 checkService.recordPlaySuccess(candidate.source());
                 kickPreheatAhead(uid, subscriptionId, episode);
+                kickCollectionFallback(uid, subscriptionId, episode);
                 return result;
             } catch (Exception e) {
                 log.info("subscription {} episode {} via {} failed: {}", subscriptionId, episode, path, e.getMessage());
                 errors.add(path + ": " + e.getMessage());
                 checkService.recordPlayFailure(subscription, candidate);
             }
+        }
+        // 采集源兜底(播放链路最后一级):候选全灭(含零候选缺集 —— attempted 不涨)才介入,
+        // 开关关闭时零调用;补集只落覆盖层不改写本订阅数据,失败继续走既有巡检补救路径
+        try {
+            Map<String, Object> rescued = episodeFallbackService.resolveEpisodeFallback(subscription, episode, client, type);
+            if (rescued != null) {
+                kickCollectionFallback(uid, subscriptionId, episode);
+                kickPreheatAhead(uid, subscriptionId, episode);
+                return rescued;
+            }
+        } catch (Exception e) {
+            log.debug("collection fallback for subscription {} episode {} failed: {}",
+                    subscriptionId, episode, e.getMessage());
         }
         // 全部候选都播不了:播放期是信噪比最高的失效信号,不能只记个失败就完事——
         // 立刻异步补救(先查池换源,池空才搜索),否则用户重试多少次都是同一个死源。
@@ -1695,6 +1919,16 @@ public class MediaSubscriptionService {
             checkService.preheatAheadAsync(uid, subscriptionId, episode);
         } catch (Exception e) {
             log.debug("trigger preheat ahead for subscription {} failed: {}", subscriptionId, e.getMessage());
+        }
+    }
+
+    /** 播放成功后后台补齐「当前集+后3集」缺口的采集源覆盖层(类注释口径:当前集正常起播时补齐不阻塞)。
+     *  窗口无缺口时零开销(一次集号查询),开关/负缓存/10min 限频在 EpisodeFallbackService 内部自查。 */
+    private void kickCollectionFallback(int uid, int subscriptionId, int episode) {
+        try {
+            episodeFallbackService.fillWindowAsync(uid, subscriptionId, episode);
+        } catch (Exception e) {
+            log.debug("trigger collection fallback fill for subscription {} failed: {}", subscriptionId, e.getMessage());
         }
     }
 
@@ -1874,6 +2108,15 @@ public class MediaSubscriptionService {
     public String subscriptionStatusText(int uid, int subId) {
         MediaSubscription subscription = getOwned(uid, subId);
         String text = displayName(subscription) + " · " + buildRemarks(subscription);
+        List<Integer> weekdays = List.copyOf(MediaSubscriptionCheckService.parseAirWeekdays(subscription.getAirWeekdays()));
+        if (!weekdays.isEmpty()) {
+            String joined = weekdays.stream().map(day -> WEEKDAYS[day - 1])
+                    .collect(java.util.stream.Collectors.joining("、"));
+            text += "\n更新日:" + joined;
+        }
+        if (hasNextAir(subscription)) {
+            text += "\n下集播出:" + airTimeText(subscription.getNextAirTime());
+        }
         String missing = missingEpisodesSummary(subscription);
         if (missing != null) {
             text += "\n" + missing;
@@ -2168,6 +2411,25 @@ public class MediaSubscriptionService {
                 matrix.computeIfAbsent(number, k -> new ArrayList<>()).add(item);
             }
         }
+        // 3) 采集源兜底覆盖层:已垫底的缺集呈现为「采集兜底」来源(ACTIVE 未过期;72h TTL 到期自然出局回缺失)
+        if (episodeFallbackService != null) {
+            for (cn.har01d.alist_tvbox.entity.MediaSubscriptionEpisodeFallback row : episodeFallbackService.activeRows(id)) {
+                int number = row.getEpisode();
+                if (number <= 0) {
+                    continue;
+                }
+                String label = "采集兜底:" + StringUtils.defaultIfBlank(row.getLine(), row.getSiteId());
+                sources.putIfAbsent(number, label);
+                Map<String, Object> item = new java.util.LinkedHashMap<>();
+                item.put("title", label);
+                item.put("drive", "");
+                item.put("state", "FALLBACK");
+                item.put("successCount", row.getValidatedAt() == null ? 0 : 1);
+                item.put("failCount", 0);
+                item.put("lastVerifiedTime", row.getValidatedAt());
+                matrix.computeIfAbsent(number, k -> new ArrayList<>()).add(item);
+            }
+        }
         if (!rowsSeen) {
             // 集源行完全未同步(首轮巡检前):退回 currentEpisodes 显示,避免页签全灰。
             // 行一旦存在就不再兜底 —— 主源失效/换源后 currentEpisodes 是旧值,
@@ -2193,13 +2455,17 @@ public class MediaSubscriptionService {
             // 手动锁定总集数是未播占位的上界;观测真实文件不参与夹紧(与 computeMissing 同规)
             base = Math.max(totalCap, observedBase);
         }
+        Integer seasonWindowEnd = checkService == null ? null : checkService.seasonWindowEnd(subscription);
+        if (seasonWindowEnd != null && seasonWindowEnd > 0) {
+            base = Math.min(base, seasonWindowEnd);
+        }
         List<Map<String, Object>> result = new ArrayList<>();
         // 季起始集号下界:分季订阅对齐后本季从全剧第 N 集开始,季前旧集不属于本订阅(与 computeMissing 同规)
         int lower = subscription.getSeasonStartEpisode() != null && subscription.getSeasonStartEpisode() > 1
                 ? subscription.getSeasonStartEpisode() : 1;
         for (int i = lower; i <= Math.min(base, MAX_EPISODE_ROWS); i++) {
             String source = sources.get(i);
-            boolean present = source != null; // 可用性只认 LIVE 行;"源损坏"是展示文案,不是已有
+            boolean present = source != null; // 可用性 = LIVE 行 ∪ 采集兜底覆盖层;"源损坏"是展示文案,不是已有
             if (source == null && deadByEpisode.containsKey(i)) {
                 source = "源损坏(待补源)";
             }
@@ -2255,8 +2521,10 @@ public class MediaSubscriptionService {
             media.put("writers", details.getWriters() == null ? List.of() : details.getWriters());
             media.put("cast", details.getCast() == null ? List.of() : details.getCast());
         }
-        if (subscription.isSeasonAiredOut()) {
-            // 季口径覆盖剧级 status:多季剧本季播完时整部剧仍是 RETURNING,详情页不能继续显示"在播"
+        if (subscription.isSeasonAiredOut() || MediaSubscription.STATUS_ENDED.equals(subscription.getStatus())) {
+            // 季口径覆盖剧级 status:多季剧本季播完时整部剧仍是 RETURNING,详情页不能继续显示"在播";
+            // 订阅已完结(含元数据滞后形态:官方已播未知/滞后,靠集齐总数完结,龙之家族 S3 线上案)
+            // 同理 —— 列表/remarks 已是完结口径,详情徽标不能再挂 UNKNOWN/在播
             media.put("status", MetadataDetails.STATUS_ENDED);
         }
         // 条目外链(豆瓣/TMDB/Bangumi 页面,新窗跳转):订阅绑定源 + 桥接拿到的跨源 id
@@ -2700,6 +2968,16 @@ public class MediaSubscriptionService {
     }
 
     /** 主网盘覆盖存储:去重取前 2 个分享类型码,逗号分隔;空 → null(跟随全局 msub_main_drives)。 */
+    /** 更新日序列化(ISO 周几 List → 升序 CSV);null/空/全非法 → null(未配置)。 */
+    static String serializeAirWeekdays(List<Integer> days) {
+        if (days == null || days.isEmpty()) {
+            return null;
+        }
+        String csv = days.stream().filter(day -> day != null && day >= 1 && day <= 7)
+                .distinct().sorted().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+        return csv.isEmpty() ? null : csv;
+    }
+
     static String serializeMainDrives(List<Integer> mainDrives) {
         if (mainDrives == null || mainDrives.isEmpty()) {
             return null;
@@ -2824,14 +3102,22 @@ public class MediaSubscriptionService {
         return name + " 第" + subscription.getSeason() + "季";
     }
 
-    /** 条目页外链:豆瓣 subject / TMDB tv / Bangumi subject / B站番剧播放页(bilibili id 为「ss123」形态)。 */
+    /** 条目页外链:豆瓣 subject / TMDB tv·movie / Bangumi subject / B站番剧播放页(bilibili id 为「ss123」形态)。 */
     private static void appendMetaLink(Map<String, Object> links, String provider, String id) {
         if (StringUtils.isBlank(provider) || StringUtils.isBlank(id)) {
             return;
         }
         switch (provider) {
             case "douban" -> links.putIfAbsent("豆瓣", "https://movie.douban.com/subject/" + id + "/");
-            case "tmdb" -> links.putIfAbsent("TMDB", "https://www.themoviedb.org/tv/" + id);
+            case "tmdb" -> {
+                // 电影订阅 metaId 为 movie:{id} 形态,外链须走 /movie/ 路径
+                if (id.startsWith(cn.har01d.alist_tvbox.service.metadata.TmdbMetadataProvider.MOVIE_ID_PREFIX)) {
+                    links.putIfAbsent("TMDB", "https://www.themoviedb.org/movie/"
+                            + id.substring(cn.har01d.alist_tvbox.service.metadata.TmdbMetadataProvider.MOVIE_ID_PREFIX.length()));
+                } else {
+                    links.putIfAbsent("TMDB", "https://www.themoviedb.org/tv/" + id);
+                }
+            }
             case "bangumi" -> links.putIfAbsent("Bangumi", "https://bgm.tv/subject/" + id);
             case "bilibili" -> links.putIfAbsent("B站", "https://www.bilibili.com/bangumi/play/" + id + "/");
             default -> {
@@ -2845,13 +3131,20 @@ public class MediaSubscriptionService {
      * 快照由巡检 refreshMetadata / 异步预热(prewarmCoverAsync)回填。
      */
     private String coverOf(MediaSubscription subscription) {
+        return coverOf(subscription, null);
+    }
+
+    /** @param ctx 列表批量上下文(null=单条现查)。 */
+    private String coverOf(MediaSubscription subscription, ListBatchContext ctx) {
         if (StringUtils.isNotBlank(subscription.getCoverUrl())) {
             return subscription.getCoverUrl();
         }
         if (subscription.getDoubanId() != null) {
-            var movie = movieRepository.findById(subscription.getDoubanId()).orElse(null);
-            if (movie != null && StringUtils.isNotBlank(movie.getCover())) {
-                return movie.getCover();
+            String cover = ctx != null
+                    ? ctx.coverByDoubanId().get(subscription.getDoubanId())
+                    : movieRepository.findById(subscription.getDoubanId()).map(Movie::getCover).orElse(null);
+            if (StringUtils.isNotBlank(cover)) {
+                return cover;
             }
         }
         return Constants.ALIST_PIC;
@@ -2982,7 +3275,51 @@ public class MediaSubscriptionService {
         return split.isEmpty() ? null : String.join("\n", split);
     }
 
+    /** 列表批量装配上下文:一次 IN 查询按订阅分组,消 toDto 逐订阅 N+1(百级订阅单请求可省数百次查询)。 */
+    private record ListBatchContext(
+            Map<Integer, List<MediaSubscriptionResource>> resourcesBySub,
+            Map<Integer, Set<Integer>> presentBySub,
+            Map<Integer, String> coverByDoubanId,
+            String globalMainDrivesRaw,
+            List<String> extendedDrives) {}
+
+    private ListBatchContext loadBatchContext(List<MediaSubscription> subscriptions) {
+        if (subscriptions.isEmpty()) {
+            return new ListBatchContext(Map.of(), Map.of(), Map.of(), "", List.of());
+        }
+        List<Integer> ids = subscriptions.stream().map(MediaSubscription::getId).toList();
+        Map<Integer, List<MediaSubscriptionResource>> resourcesBySub = new HashMap<>();
+        for (MediaSubscriptionResource r : resourceRepository.findBySubscriptionIdIn(ids)) {
+            resourcesBySub.computeIfAbsent(r.getSubscriptionId(), k -> new ArrayList<>()).add(r);
+        }
+        // 与单条 findBySubscriptionIdOrderByScoreDesc 同序(score 降序,null 兜底)
+        resourcesBySub.values().forEach(list -> list.sort(Comparator
+                .comparing(MediaSubscriptionResource::getScore, Comparator.nullsLast(Comparator.reverseOrder()))));
+        Map<Integer, Set<Integer>> presentBySub = new HashMap<>();
+        for (Object[] row : episodeSourceRepository.findSubscriptionIdAndNumbersByStatesIn(ids, LIVE_EPISODE_STATES)) {
+            presentBySub.computeIfAbsent((Integer) row[0], k -> new HashSet<>()).add((Integer) row[1]);
+        }
+        Map<Integer, String> coverByDoubanId = new HashMap<>();
+        List<Integer> doubanIds = subscriptions.stream().map(MediaSubscription::getDoubanId)
+                .filter(java.util.Objects::nonNull).distinct().toList();
+        if (!doubanIds.isEmpty()) {
+            for (Movie movie : movieRepository.findAllById(doubanIds)) {
+                if (StringUtils.isNotBlank(movie.getCover())) {
+                    coverByDoubanId.put(movie.getId(), movie.getCover());
+                }
+            }
+        }
+        String globalRaw = settingRepository.findById(MediaSubscriptionCheckService.MSUB_MAIN_DRIVES)
+                .map(Setting::getValue).orElse("");
+        return new ListBatchContext(resourcesBySub, presentBySub, coverByDoubanId, globalRaw, checkService.extendedDrives());
+    }
+
     MediaSubscriptionDto toDto(MediaSubscription subscription) {
+        return toDto(subscription, null);
+    }
+
+    /** @param ctx 列表批量装配上下文(null=单条路径,逐项现查)。 */
+    MediaSubscriptionDto toDto(MediaSubscription subscription, ListBatchContext ctx) {
         MediaSubscriptionDto dto = new MediaSubscriptionDto();
         dto.setId(subscription.getId());
         dto.setName(subscription.getName());
@@ -2997,7 +3334,7 @@ public class MediaSubscriptionService {
         dto.setOfficialTotal(subscription.getOfficialTotal());
         dto.setOfficialStatus(subscription.getOfficialStatus());
         dto.setNextAirTime(subscription.getNextAirTime());
-        String cover = coverOf(subscription);
+        String cover = coverOf(subscription, ctx);
         dto.setCover(Constants.ALIST_PIC.equals(cover) ? null : proxiedCover(cover));
         dto.setMode(subscription.getMode());
         dto.setAccountId(subscription.getAccountId());
@@ -3005,21 +3342,27 @@ public class MediaSubscriptionService {
         dto.setMountPath(subscription.getMountPath());
         dto.setCrossDrive(subscription.isCrossDrive());
         dto.setMagnetOffline(subscription.isMagnetOffline());
+        dto.setSelfShare(subscription.isSelfShare());
         dto.setMainDrives(parseMainDrives(subscription.getMainDrives()));
         dto.setStatus(subscription.getStatus());
         dto.setExpectedEpisodes(subscription.getExpectedEpisodes());
         dto.setManualTotalEpisodes(subscription.getManualTotalEpisodes());
         dto.setCurrentEpisodes(subscription.getCurrentEpisodes());
         dto.setMaxEpisode(subscription.getMaxEpisode());
-        dto.setMissingEpisodes(missingEpisodes(subscription));
+        dto.setMissingEpisodes(missingEpisodes(subscription, ctx));
         dto.setStallCount(subscription.getStallCount());
         dto.setCheckIntervalHours(subscription.getCheckIntervalHours());
         dto.setCustomAirClock(subscription.getCustomAirClock());
+        dto.setAirWeekdays(List.copyOf(MediaSubscriptionCheckService.parseAirWeekdays(subscription.getAirWeekdays())));
         dto.setNextCheckTime(subscription.getNextCheckTime());
         dto.setLastCheckTime(subscription.getLastCheckTime());
         dto.setCreatedTime(subscription.getCreatedTime());
-        List<MediaSubscriptionResource> resources = resourceRepository.findBySubscriptionIdOrderByScoreDesc(subscription.getId());
-        Set<String> allowedDrives = checkService.allowedCandidateDrives(subscription); // 与候选源抽屉同口径
+        List<MediaSubscriptionResource> resources = ctx != null
+                ? ctx.resourcesBySub().getOrDefault(subscription.getId(), List.of())
+                : resourceRepository.findBySubscriptionIdOrderByScoreDesc(subscription.getId());
+        Set<String> allowedDrives = ctx != null
+                ? checkService.allowedCandidateDrives(subscription, ctx.extendedDrives(), ctx.globalMainDrivesRaw())
+                : checkService.allowedCandidateDrives(subscription); // 与候选源抽屉同口径
         dto.setResourceCount((int) resources.stream()
                 .filter(r -> MediaSubscriptionResource.STATE_MOUNTED.equals(r.getState())
                         || MediaSubscriptionCheckService.driveAllowed(allowedDrives,
@@ -3045,11 +3388,18 @@ public class MediaSubscriptionService {
     }
 
     private List<Integer> missingEpisodes(MediaSubscription subscription) {
+        return missingEpisodes(subscription, null);
+    }
+
+    /** @param ctx 列表批量上下文(null=单条现查)。 */
+    private List<Integer> missingEpisodes(MediaSubscription subscription, ListBatchContext ctx) {
         // 与巡检 computeMissing 同口径:官方已播/期望/观测最大集号取大为范围 ——
         // 只认 expectedEpisodes 时,未配期望的长番(柯南 expected=null)永远拿不到缺口提示
-        Set<Integer> present = episodeSourceRepository.findNumbersBySubscriptionAndStatesIn(subscription.getId(),
-                LIVE_EPISODE_STATES)
-                .stream().collect(java.util.stream.Collectors.toSet());
+        Set<Integer> present = ctx != null
+                ? new java.util.HashSet<>(ctx.presentBySub().getOrDefault(subscription.getId(), java.util.Set.of()))
+                : episodeSourceRepository.findNumbersBySubscriptionAndStatesIn(subscription.getId(),
+                        LIVE_EPISODE_STATES)
+                        .stream().collect(java.util.stream.Collectors.toSet());
         if (present.isEmpty() && subscription.getCurrentEpisodes() != null) {
             for (int i = 1; i <= subscription.getCurrentEpisodes(); i++) {
                 present.add(i);
@@ -3067,6 +3417,10 @@ public class MediaSubscriptionService {
             projected = Math.min(projected, total);
         }
         base = Math.max(base, projected);
+        Integer seasonWindowEnd = checkService == null ? null : checkService.seasonWindowEnd(subscription);
+        if (seasonWindowEnd != null && seasonWindowEnd > 0) {
+            base = Math.min(base, seasonWindowEnd);
+        }
         if (base <= 0 || base > MAX_EPISODE_ROWS) {
             return List.of();
         }

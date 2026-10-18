@@ -1,6 +1,8 @@
 package cn.har01d.alist_tvbox.service.sitesearch;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.dto.WanouDomainStatus;
+import cn.har01d.alist_tvbox.dto.WanouSiteStatus;
 import cn.har01d.alist_tvbox.dto.tg.Message;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -13,6 +15,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -20,11 +23,13 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -37,80 +42,147 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * 玩偶聚合搜索源(atv-spiders/py/玩偶聚合.py 的 Java 移植):聚合玩偶系 MacCMS 网盘站
- * (玩偶/多多/木偶/欧歌/至臻/蜡笔/二小/虎斑/小斑/快映/闪电),并行按站搜索 → 卡片标题
+ * (玩偶/多多/木偶/快映/闪电/表哥/花卷/欧歌/虎斑/二小/蜡笔),并行按站搜索 → 卡片标题
  * 与订阅关键词粗匹配 → 抓详情页提取网盘分享链接,产出与 TG 搜索同构的 {@link Message},
  * 供追剧候选池(fillPool/preview)与 TG 结果按 link 去重合并。
+ * <p>2026-09-20 与 py 同步(atv-spiders 9880ef2):移除六死站(欧歌/至臻/二小/蜡笔/虎斑/小斑),
+ * 新增表哥(punycode 域名)与花卷(海报卡片 + down-card-url 详情形状)。
+ * <p>2026-09-26 与 py 对齐:欧歌(woog 新入口)与虎斑(裸 IP 轮换入口,38.76.197.172/xhban.xyz
+ * 均 302 到 43.248.128.118)实测复活回归,两站详情形状为 module-row-info 容器文本自身(非其下 p)。
+ * 同晚按用户提供的玩偶配置 v2(12 站生态配置,比 py 更新的域名清单)补齐各站全部备用域名,
+ * 二小随新入口 2xiaopan.one 复活回归(蜡笔/至臻实测仍死未接);表哥在该配置中又名「龙龙/longlong」。
+ * <p>2026-09-27 蜡笔随 py 蜡笔.py 复活回归:tvpanpan.site 实测存活,xiaocgege.shop 双域名 CF 409
+ * 降为恢复候选(feimo.fun 域名过期剔除);标准搜索卡片/详情形状,站内搜索已改默认 path-info 路由。
+ * <p>2026-10-01 玩偶配置 v3 同步(7 站主入口对齐,旧入口降为备用垫底):蜡笔换域名 tvpanpan.site
+ * 已死、新入口 www.mmpanpan.site 实测存活;快映与虎斑同款裸 IP 轮换形态(38.76.197.172:12521
+ * 302 到 43.248.128.118:12512),补直连终点入池首位;木偶 666.666291.xyz 提首位(服务存活,
+ * 部分网络环境 444 拒连,探测兜底),停放页 muou.site 降后;闪电 shandian.blog、多多 tv.214521.xyz
+ * 实测存活提首位;欧哥/虎斑入口未变。
+ * <p>2026-10-15 pan-site-monitor 恢复更新(9 站全 success),按其 /api/data 同步:玩偶剔两个
+ * DNS 已亡的 xxooo.cf 域名、www.wogg.net 提首位;蜡笔 tvpanpan.site 复活提回首位;花卷/快映
+ * 补挂 monitorKey(monitor 的「小斑」键即 :12512 快映池);二小 monitor 虽删键、2xiaopan.one
+ * 实测仍存活,种子不动。
  *
- * <p>站点域名由监控服务(pan-site-monitor)定期下发最新可达地址(按延迟排序),静态域名
- * 表仅作兜底种子;请求时逐域名 failover,成功域名置顶粘住,全域名失败进入冷却期避免反复撞墙。
+ * <p>站点域名池 = 静态种子 ∪ 监控服务(pan-site-monitor)下发的候选(含其标记失败的域名,
+ * 可能复活);本服务定时主动探测各域名可达性与延迟(判定参考自建 domain-monitor:200 且
+ * 非挑战页/停放页、长度下限、MacCMS 特征——muou.site 实测 200+DNSPod 停放页即被拦),
+ * 按延迟升序重排——搜索直接从最优域名起步,请求时逐域名 failover 与成功粘滞作为探测
+ * 间隙内的兜底(搜索期同样跳过停放页),全域名失败进入冷却期。
  */
 @Slf4j
 @Service
 public class WanouSearchService {
     private static final String DEFAULT_SEARCH_URL = "/index.php/vod/search/page/{page}/wd/{keyword}.html";
+    /** 标准搜索卡片选择器(花卷等海报站可覆写) */
+    private static final String DEFAULT_SEARCH_CARD_CSS = ".module-search-item";
+    /** 标准详情分享链接选择器(花卷走 down-card-url) */
+    private static final String DEFAULT_DETAIL_PAN_CSS = ".module-row-info p";
     /** 域名监控刷新周期 */
     private static final long DOMAIN_REFRESH_MS = 6 * 60 * 60_000L;
     /** 监控拉取失败后的重试间隔 */
     private static final long DOMAIN_RETRY_MS = 10 * 60_000L;
     /** 全域名失败的站点冷却期 */
     private static final long SITE_DEAD_COOLDOWN_MS = 30 * 60_000L;
+    /** 内置域名探测周期(一小时:域名轮换是小时/天级,再快只是白撞 Cloudflare) */
+    private static final long DOMAIN_PROBE_INTERVAL_MS = 60 * 60_000L;
+    /** 单域名探测超时(秒) */
+    private static final int DOMAIN_PROBE_TIMEOUT_SECONDS = 8;
+    /** 探测有效页的最小长度(参考自建 domain-monitor:停放/劫持页普遍短小) */
+    private static final int PROBE_MIN_BODY_LENGTH = 1000;
+    /** 域名停放/过期页标记(参考自建 domain-monitor 与 py 蜡笔 _PARKED_MARKERS):200+停放页不算可达 */
+    private static final List<String> PARKED_MARKERS = List.of(
+            "domain is expired", "domain has expired", "domains expired", "domain is parked",
+            "is for sale", "buy this domain", "域名已过期", "域名过期", "域名到期", "域名已到期");
+    /** MacCMS 站点首页特征(参考自建 domain-monitor hasCms 判定):无特征的 200 页不是站点本体 */
+    private static final List<String> CMS_MARKERS = List.of(
+            "maccms", "vod_", "template/", "class=\"stui-", "class=\"module-",
+            "/static/js/player", "dyxs2", "static/picture/logo");
+    /** 探测线程序号(线程名 wanou-probe-N) */
+    private static final AtomicInteger PROBE_SEQ = new AtomicInteger();
     private static final Pattern URL_IN_TEXT = Pattern.compile("https?://[^\\s\\u3400-\\u4dbf\\u4e00-\\u9fff\\u3000-\\u303f\\uff01-\\uff5e<>\"']+");
     private static final Pattern PASSWORD_IN_TEXT = Pattern.compile("(?:提取码|密码|访问码|pwd)[=:\\s：]*([a-zA-Z0-9]{4,6})");
     private static final String URL_TRAILING = "#，。；：,.;:！？、）)】」』》>\"'";
     /** 标题归一化:画质/站名噪声词 + 分隔符(py 玩偶聚合 _normalize_title) */
-    private static final Pattern TITLE_NOISE = Pattern.compile("(?i)4k|hdr|2160p|1080p|720p|玩偶|木偶|蜡笔");
+    private static final Pattern TITLE_NOISE = Pattern.compile("(?i)4k|hdr|2160p|1080p|720p|玩偶|木偶");
     private static final Pattern TITLE_SEPARATOR = Pattern.compile("[\\s\\-_.·,，。!！?？:：()（）\\[\\]]+");
     /** 关键词侧额外剥掉的集数/季/年份标记(订阅关键词常带"第2季/第12集/2025"后缀,卡片标题通常没有) */
     private static final Pattern KEYWORD_MARKER = Pattern.compile(
             "(?i)(第[0-9一二三四五六七八九十]{1,3}季|season\\d{1,2}|s\\d{1,2}e\\d{1,3}|ep?\\d{1,3}|第\\d{1,3}集|更新?至\\d{1,3}|全\\d{1,3}集|\\d{1,3}集|20\\d{2})");
     /** 站点优先级(py site_priority):同名合并去重时优先保留靠前站点的链接 */
     private static final List<String> SITE_PRIORITY = List.of(
-            "wanou", "duoduo", "muou", "ouge", "zhizhen", "labi", "erxiao", "huban", "xiaoban", "kuaiying", "shandian");
+            "wanou", "duoduo", "muou", "kuaiying", "shandian", "biaoge", "huajuan", "ouge", "hban", "erxiao", "labi");
 
     record Site(String id, String name, String monitorKey, List<String> seedDomains,
-                String searchUrl, int timeoutSeconds, boolean clipboardDetail) {
+                String searchUrl, int timeoutSeconds, String searchCardCss, String detailPanCss) {
     }
 
     record Card(String href, String title, String remarks) {
     }
 
+    /** 单域名探测结果:ok=首页可达(200 且非挑战页/停放页、有 CMS 特征),latencyMs=完整请求耗时,error=失败原因。 */
+    record DomainProbe(String url, boolean ok, long latencyMs, String error) {
+    }
+
+    /** 单站探测结果:domains 已按采用优先级排序(可达按延迟升序在前,不可达垫底),首条即当前采用域名。 */
+    record SiteProbe(String siteId, String siteName, List<DomainProbe> domains) {
+        String bestUrl() {
+            return domains.stream().filter(DomainProbe::ok).findFirst().map(DomainProbe::url).orElse(null);
+        }
+    }
+
     private static final List<Site> SITES = List.of(
+            // 木偶:2026-10-01 主入口 666.666291.xyz(服务存活,部分网络环境 nginx 444 拒连,探测自动判定);
+            // muou.site 实测 DNSPod 停放页降后
             new Site("muou", "木偶", "木偶",
-                    List.of("https://www.muou.site", "https://www.muou.asia", "https://666.666291.xyz", "https://123.666291.xyz"),
-                    null, 10, false),
-            new Site("ouge", "欧歌", "欧哥",
-                    List.of("https://woog.nxog.eu.org", "https://woog.430520.xyz", "https://woog.nxog.fun"),
-                    null, 10, false),
-            new Site("zhizhen", "至臻", "至臻",
-                    List.of("https://www.mihdr.top", "https://www.miqk.cc", "https://mihdr.top"),
-                    null, 10, false),
-            new Site("erxiao", "二小", "二小",
-                    List.of("https://www.2xiaopan.top", "https://wexwp.cc", "https://www.wexwp.cc"),
-                    null, 10, false),
+                    List.of("https://666.666291.xyz", "https://www.muou.site", "https://www.muou.asia",
+                            "https://123.666291.xyz", "https://www.muoua.top", "https://333.333291.xyz"),
+                    null, 10, null, null),
             new Site("duoduo", "多多", "多多",
-                    List.of("https://tv.yydsys.top", "https://tv.yydsys.cc", "https://yydsys.de5.net", "https://tv.214521.xyz"),
-                    null, 10, false),
-            new Site("labi", "蜡笔", "蜡笔",
-                    List.of("http://xiaocgege.shop", "http://feimo.fun", "http://tvpanpan.site"),
-                    null, 10, false),
-            new Site("huban", "虎斑", "虎斑",
-                    List.of("http://121.205.88.174:16969"),
-                    null, 10, true),
-            new Site("xiaoban", "小斑", "小斑",
-                    List.of("http://121.205.88.174:12512"),
-                    null, 20, true),
+                    List.of("https://tv.214521.xyz", "https://yydsys.de5.net", "https://tv.yydsys.cc",
+                            "https://tv.yydsys.top", "https://pan.yydsys.de"),
+                    null, 10, null, null),
             new Site("wanou", "玩偶", "玩偶",
-                    List.of("https://woggpan.xxooo.cf", "https://wogg.xxooo.cf", "https://woggpan.888484.xyz", "https://www.wogg.net"),
-                    "/vodsearch/-------------.html?wd={keyword}&page={page}", 10, false),
-            new Site("kuaiying", "快映", null,
-                    List.of("http://xsayang.fun:12512"),
-                    null, 10, false),
+                    List.of("https://www.wogg.net", "https://woggpan.888484.xyz", "https://www.wogg.live"),
+                    "/vodsearch/-------------.html?wd={keyword}&page={page}", 10, null, null),
+            // 快映:与虎斑同款裸 IP 轮换(38.76.197.172:12521 实测 302 到 43.248.128.118:12512),直连终点居首省一跳;
+            // monitor 的「小斑」键跟踪的就是这个 :12512 池(站名两个叫法),裸 IP 轮换入口靠监控下发新地址
+            new Site("kuaiying", "快映", "小斑",
+                    List.of("http://43.248.128.118:12512", "http://38.76.197.172:12521",
+                            "http://xsayang.fun:12512", "http://103.45.162.207:12512"),
+                    null, 10, null, null),
             new Site("shandian", "闪电", "闪电",
-                    List.of("http://sd.sduc.site", "http://shandian.blog"),
-                    null, 10, false));
+                    List.of("http://shandian.blog", "http://sd.sduc.site", "http://sduc.cloud"),
+                    null, 10, null, null),
+            new Site("biaoge", "表哥", null,
+                    List.of("http://xn--4yqy17f.xn--yi7aa.vip:3155"),
+                    null, 10, null, null),
+            new Site("huajuan", "花卷", "花卷",
+                    List.of("https://www.hjzhencai.top"),
+                    null, 10, ".module-card-item-poster", ".down-card-url"),
+            // 欧歌/虎斑:2026-09-26 随 py 复活回归;详情形状是 module-row-info 容器文本自身(标准站是其下 p)
+            new Site("ouge", "欧歌", "欧哥",
+                    List.of("https://woog.nxog.eu.org", "https://woog.430520.xyz", "https://woog.nxog.fun",
+                            "https://ogkk.nxog.eu.org"),
+                    null, 10, null, ".module-row-info"),
+            // 虎斑只挂裸 IP 且入口轮流换(38.76.197.172/xhban.xyz 均 302 到 43.248.128.118),探测按可达性自动跟随现行入口
+            new Site("hban", "虎斑", "虎斑",
+                    List.of("http://43.248.128.118:16969", "http://38.76.197.172:16969",
+                            "http://xhban.xyz:20720", "http://xhban.xyz"),
+                    null, 10, null, ".module-row-info"),
+            // 二小:2026-09-26 随玩偶配置 v2 复活回归(新入口 2xiaopan.one 实测 200);蜡笔/至臻同期实测仍死未接
+            new Site("erxiao", "二小", "二小",
+                    List.of("https://www.2xiaopan.one", "https://www.2xiaopan.top", "https://www.wexwp.cc"),
+                    null, 10, null, null),
+            // 蜡笔:2026-10-01 tvpanpan.site 实测已死换 mmpanpan.site 居首,2026-10-15 随 monitor 复活提回首位;
+            // xiaocgege.shop(CF 409)保持恢复候选,探测复活自动顶回
+            new Site("labi", "蜡笔", "蜡笔",
+                    List.of("http://tvpanpan.site", "https://www.mmpanpan.site",
+                            "http://www.xiaocgege.shop", "http://xiaocgege.shop"),
+                    null, 10, null, null));
 
     private static final class DomainState {
         volatile List<String> ordered;
@@ -127,10 +199,19 @@ public class WanouSearchService {
     private final Map<String, DomainState> domainStates = new ConcurrentHashMap<>();
     private final AtomicLong monitorRefreshedAt = new AtomicLong(0);
     private final AtomicBoolean monitorRefreshing = new AtomicBoolean(false);
-    /** 站点池线程序号(线程名 wanou-search-N):11 站并发时日志可分辨线程 */
+    /** 最近一轮探测快照(站点 id → 结果),供状态面板与手动触发读取;启动首轮探测前为空表 */
+    private volatile List<SiteProbe> lastProbes = List.of();
+    private final AtomicBoolean probing = new AtomicBoolean(false);
+    /** 站点池线程序号(线程名 wanou-search-N):多站并发时日志可分辨线程 */
     private static final AtomicInteger SEARCH_SEQ = new AtomicInteger();
     private final ExecutorService executor = Executors.newFixedThreadPool(SITES.size(), r -> {
         Thread thread = new Thread(r, "wanou-search-" + SEARCH_SEQ.incrementAndGet());
+        thread.setDaemon(true);
+        return thread;
+    });
+    /** 探测池:全站全域名一次性并行(约 30 个首页 GET,各站瞬时并发 ≤ 域名数,无压力) */
+    private final ExecutorService probeExecutor = Executors.newCachedThreadPool(r -> {
+        Thread thread = new Thread(r, "wanou-probe-" + PROBE_SEQ.incrementAndGet());
         thread.setDaemon(true);
         return thread;
     });
@@ -162,7 +243,7 @@ public class WanouSearchService {
             futures.add(executor.submit(() -> searchSite(site, kw)));
         }
 
-        long deadline = System.currentTimeMillis() + appProperties.getSubscription().getWanouTimeoutSeconds() * 1000L;
+        long deadline = System.currentTimeMillis() + Math.max(5, appProperties.getSubscription().getWanouTimeoutSeconds()) * 1000L;
         List<Message> result = new ArrayList<>();
         Set<String> seenLinks = new HashSet<>();
         boolean cancelled = false;
@@ -206,7 +287,7 @@ public class WanouSearchService {
         }
         List<Message> messages = new ArrayList<>();
         try {
-            List<Card> cards = parseSearchCards(requestWithFailover(site, buildSearchPath(site, keyword)));
+            List<Card> cards = parseSearchCards(site, requestWithFailover(site, buildSearchPath(site, keyword)));
             int maxDetails = appProperties.getSubscription().getWanouMaxDetailPages();
             int details = 0;
             Set<String> seenLinks = new HashSet<>();
@@ -263,17 +344,22 @@ public class WanouSearchService {
         return template.replace("{keyword}", encoded).replace("{page}", "1");
     }
 
-    /** 搜索结果卡片解析(py _parse_search_cards 的 Jsoup 等价实现)。 */
-    List<Card> parseSearchCards(String html) {
+    /** 搜索结果卡片解析(py _parse_search_cards 的 Jsoup 等价实现,卡片选择器按站可覆写:
+     *  花卷是海报卡片 module-card-item-poster,无 video-serial,链接在卡片节点自身)。 */
+    List<Card> parseSearchCards(Site site, String html) {
         Document doc = Jsoup.parse(html);
         List<Card> cards = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        for (Element card : doc.select(".module-search-item")) {
+        String css = site.searchCardCss() == null ? DEFAULT_SEARCH_CARD_CSS : site.searchCardCss();
+        for (Element card : doc.select(css)) {
             Element serial = card.selectFirst(".video-serial");
             String href = serial == null ? "" : StringUtils.trimToEmpty(serial.attr("href"));
             if (href.isEmpty()) {
                 Element a = card.selectFirst("a[href]");
                 href = a == null ? "" : a.attr("href").trim();
+            }
+            if (href.isEmpty()) {
+                href = card.attr("href").trim();
             }
             String title = serial == null ? "" : serial.attr("title").trim();
             if (title.isEmpty()) {
@@ -286,6 +372,10 @@ public class WanouSearchService {
             }
             Element text = card.selectFirst(".module-item-text");
             String remarks = text == null ? "" : text.text().trim();
+            if (remarks.isEmpty()) {
+                Element note = card.selectFirst(".module-item-note");
+                remarks = note == null ? "" : note.text().trim();
+            }
             if (href.isEmpty() || title.isEmpty() || !seen.add(href)) {
                 continue;
             }
@@ -295,20 +385,15 @@ public class WanouSearchService {
     }
 
     /**
-     * 详情页分享链接提取:虎斑/小斑走 data-clipboard-text(剪贴板属性里是完整分享链),
-     * 其余站点取 module-row-info 下 p 文本的第一个 URL;行内"提取码"折进 ?password= 参数。
+     * 详情页分享链接提取:标准站取 module-row-info 下 p 文本的第一个 URL,花卷走
+     * down-card-url 文本;行内"提取码"折进 ?password= 参数。
      */
     List<String> parseDetailPanUrls(Site site, String html) {
         Document doc = Jsoup.parse(html);
         Set<String> urls = new LinkedHashSet<>();
-        if (site.clipboardDetail()) {
-            for (Element node : doc.select(".module-row-info .module-row-text")) {
-                addShareUrl(urls, node.attr("data-clipboard-text"));
-            }
-        } else {
-            for (Element p : doc.select(".module-row-info p")) {
-                addShareUrl(urls, p.text());
-            }
+        String css = site.detailPanCss() == null ? DEFAULT_DETAIL_PAN_CSS : site.detailPanCss();
+        for (Element node : doc.select(css)) {
+            addShareUrl(urls, node.text());
         }
         return List.copyOf(urls);
     }
@@ -455,7 +540,10 @@ public class WanouSearchService {
                 }
                 merged.addAll(site.seedDomains());
                 merged.addAll(failed);
-                domainStates.get(site.id()).ordered = List.copyOf(merged);
+                DomainState state = domainStates.get(site.id());
+                synchronized (state) {
+                    state.ordered = List.copyOf(merged);
+                }
                 updated++;
             }
             monitorRefreshedAt.set(now);
@@ -465,6 +553,126 @@ public class WanouSearchService {
             monitorRefreshedAt.set(now - DOMAIN_REFRESH_MS + DOMAIN_RETRY_MS);
         } finally {
             monitorRefreshing.set(false);
+        }
+    }
+
+    /**
+     * 定时域名探测(替代对外部监控有效性判断的依赖):先吸收监控下发的新域名,再并行探测
+     * 全部候选域名的首页可达性与延迟,把每站域名按「可达且延迟最低在前、不可达垫底」重排,
+     * 搜索从此直接从最优域名起步。探测在线程池里执行,不占调度线程。
+     */
+    @Scheduled(initialDelay = 90_000L, fixedDelay = DOMAIN_PROBE_INTERVAL_MS)
+    public void probeDomainsTask() {
+        if (!appProperties.getSubscription().isWanouEnabled()
+                || !appProperties.getSubscription().isWanouProbeEnabled()) {
+            return;
+        }
+        if (!probing.compareAndSet(false, true)) {
+            return;
+        }
+        probeExecutor.submit(() -> {
+            try {
+                probeAllDomains();
+            } catch (Exception e) {
+                log.warn("wanou domain probe failed: {}", e.getMessage());
+            } finally {
+                probing.set(false);
+            }
+        });
+    }
+
+    /** 立即探测全站域名并返回结果(状态面板手动触发入口);幂等,定时任务另有 probing 守卫防叠跑。 */
+    public List<SiteProbe> probeAllDomains() {
+        refreshDomainsIfNeeded();
+        List<CompletableFuture<SiteProbe>> futures = new ArrayList<>();
+        for (Site site : SITES) {
+            DomainState state = domainStates.get(site.id());
+            List<String> domains;
+            synchronized (state) {
+                domains = state.ordered;
+            }
+            futures.add(CompletableFuture.supplyAsync(() -> probeSite(site, domains), probeExecutor));
+        }
+        List<SiteProbe> results = futures.stream().map(CompletableFuture::join).toList();
+        lastProbes = results;
+        log.info("wanou domain probe done: {} alive / {} dead, best={}",
+                results.stream().filter(s -> s.bestUrl() != null).count(),
+                results.stream().filter(s -> s.bestUrl() == null).count(),
+                results.stream().map(s -> s.siteId() + "=" + StringUtils.defaultString(s.bestUrl(), "-"))
+                        .collect(Collectors.joining(" ")));
+        return results;
+    }
+
+    /** 最近一轮探测快照;未探测过返回空表(面板引导手动触发)。 */
+    public List<SiteProbe> domainStatuses() {
+        return lastProbes;
+    }
+
+    /** 状态面板 DTO 形态(内部探测记录 → 公开契约,排序即采用优先级)。 */
+    public List<WanouSiteStatus> domainStatusDtos() {
+        return lastProbes.stream()
+                .map(probe -> new WanouSiteStatus(probe.siteId(), probe.siteName(),
+                        probe.bestUrl() != null, probe.bestUrl(),
+                        probe.domains().stream()
+                                .map(d -> new WanouDomainStatus(d.url(), d.ok(), d.latencyMs(), d.error()))
+                                .toList()))
+                .toList();
+    }
+
+    /** 探测单站:并行测全部域名,按结果重排写回(可达按延迟升序在前,不可达垫底保持原相对顺序)。 */
+    private SiteProbe probeSite(Site site, List<String> domains) {
+        Map<String, DomainProbe> probes = domains.stream()
+                .map(url -> CompletableFuture.supplyAsync(() -> probeDomain(url), probeExecutor))
+                .map(CompletableFuture::join)
+                .collect(Collectors.toMap(DomainProbe::url, p -> p, (a, b) -> a));
+        List<DomainProbe> ordered = new ArrayList<>();
+        domains.stream().map(probes::get).filter(DomainProbe::ok)
+                .sorted(Comparator.comparingLong(DomainProbe::latencyMs))
+                .forEach(ordered::add);
+        domains.stream().map(probes::get).filter(p -> !p.ok()).forEach(ordered::add);
+        DomainState state = domainStates.get(site.id());
+        synchronized (state) {
+            state.ordered = ordered.stream().map(DomainProbe::url).toList();
+        }
+        return new SiteProbe(site.id(), site.name(), List.copyOf(ordered));
+    }
+
+    /** 探测单域名:首页 GET,完整耗时即延迟(与搜索场景同口径);由 {@link #probeFetch} 打桩可测。 */
+    private DomainProbe probeDomain(String url) {
+        long start = System.nanoTime();
+        String error = probeFetch(url);
+        long latencyMs = (System.nanoTime() - start) / 1_000_000L;
+        return new DomainProbe(url, error == null, latencyMs, error);
+    }
+
+    /** 探测请求:返回 null=可达(200 且非挑战页/停放页,有 CMS 特征),否则返回失败原因。 */
+    protected String probeFetch(String url) {
+        Request request = new Request.Builder()
+                .url(url)
+                .header("User-Agent", appProperties.getUserAgent())
+                .build();
+        OkHttpClient client = httpClient.newBuilder()
+                .connectTimeout(DOMAIN_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .readTimeout(DOMAIN_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .callTimeout(DOMAIN_PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .build();
+        try (Response response = client.newCall(request).execute()) {
+            if (response.code() != 200) {
+                return "HTTP " + response.code();
+            }
+            String body = response.body() == null ? "" : response.body().string();
+            if (isChallenge(null, body)) {
+                return "challenge";
+            }
+            if (isParked(body)) {
+                return "停放页";
+            }
+            if (body.length() <= PROBE_MIN_BODY_LENGTH) {
+                return "内容过短";
+            }
+            return hasCmsFeature(body) ? null : "无站点特征";
+        } catch (IOException e) {
+            return StringUtils.abbreviate(StringUtils.defaultString(e.getMessage(), e.getClass().getSimpleName()), 80);
         }
     }
 
@@ -490,6 +698,10 @@ public class WanouSearchService {
                 log.debug("wanou fetch blocked by challenge page: {}", url);
                 return null;
             }
+            if (isParked(body)) {
+                log.debug("wanou fetch skipped parked page: {}", url);
+                return null;
+            }
             return body;
         }
     }
@@ -502,6 +714,18 @@ public class WanouSearchService {
         return body == null || body.isBlank()
                 || body.contains("challenges.cloudflare.com")
                 || body.contains("Just a moment");
+    }
+
+    /** 域名停放/过期页判定(muou.site 实测 200+DNSPod 停放页形态;py 蜡笔 _is_parked 同款)。 */
+    static boolean isParked(String body) {
+        String lower = StringUtils.lowerCase(StringUtils.defaultString(body));
+        return PARKED_MARKERS.stream().anyMatch(lower::contains);
+    }
+
+    /** MacCMS 站点特征判定(自建 domain-monitor hasCms 同款标记)。 */
+    static boolean hasCmsFeature(String body) {
+        String lower = StringUtils.lowerCase(StringUtils.defaultString(body));
+        return CMS_MARKERS.stream().anyMatch(lower::contains);
     }
 
     private static String rootOf(String url) {
@@ -517,5 +741,6 @@ public class WanouSearchService {
     @PreDestroy
     public void shutdown() {
         executor.shutdownNow();
+        probeExecutor.shutdownNow();
     }
 }

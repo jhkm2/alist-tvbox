@@ -3,6 +3,7 @@ package cn.har01d.alist_tvbox.web;
 import cn.har01d.alist_tvbox.config.RestErrorHandler;
 import cn.har01d.alist_tvbox.service.MediaSubscriptionService;
 import cn.har01d.alist_tvbox.service.PianDanService;
+import cn.har01d.alist_tvbox.service.WebHomeService;
 import cn.har01d.alist_tvbox.service.SubscriptionService;
 import cn.har01d.alist_tvbox.tvbox.Category;
 import cn.har01d.alist_tvbox.tvbox.CategoryList;
@@ -26,24 +27,43 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
 class MediaLibraryControllerTest {
+
+    @org.junit.jupiter.api.Test
+    void subscribedRemarksIsIdempotentAndHealsAccumulation() {
+        // 线上形态:缓存对象被反复前缀(刷新一次多一个)
+        assertEquals("已追 8.2", cn.har01d.alist_tvbox.web.MediaLibraryController.subscribedRemarks("已追 已追 已追 已追 8.2", true));
+        // 幂等:归一值再标不变
+        assertEquals("已追 8.2", cn.har01d.alist_tvbox.web.MediaLibraryController.subscribedRemarks("已追 8.2", true));
+        // 未订阅:剥净历史标记(防跨 uid 缓存串标)
+        assertEquals("8.2", cn.har01d.alist_tvbox.web.MediaLibraryController.subscribedRemarks("已追 8.2", false));
+        assertEquals("", cn.har01d.alist_tvbox.web.MediaLibraryController.subscribedRemarks("已追", false));
+        assertEquals("已追", cn.har01d.alist_tvbox.web.MediaLibraryController.subscribedRemarks(null, true));
+        assertEquals("已追 豆瓣 8.0", cn.har01d.alist_tvbox.web.MediaLibraryController.subscribedRemarks("豆瓣 8.0", true));
+    }
+
     @Mock
     private SubscriptionService subscriptionService;
     @Mock
     private MediaSubscriptionService mediaSubscriptionService;
     @Mock
     private PianDanService pianDanService;
+    @Mock
+    private WebHomeService webHomeService;
+    @Mock
+    private cn.har01d.alist_tvbox.service.WatchlistService watchlistService;
 
     private MockMvc mockMvc;
 
     @BeforeEach
     void setUp() {
-        mockMvc = MockMvcBuilders.standaloneSetup(new MediaLibraryController(subscriptionService, mediaSubscriptionService, pianDanService))
+        mockMvc = MockMvcBuilders.standaloneSetup(new MediaLibraryController(subscriptionService, mediaSubscriptionService, pianDanService, webHomeService, watchlistService))
                 .setControllerAdvice(new RestErrorHandler())
                 .build();
         when(mediaSubscriptionService.resolveUid("token-a")).thenReturn(7);
@@ -94,13 +114,15 @@ class MediaLibraryControllerTest {
         item.setVod_pic("https://image.tmdb.org/t/p/w500/x.jpg");
         source.getList().add(item);
         when(pianDanService.list(eq("tmdb:tv_popular"), eq("web"), eq(1), eq(24), anyMap())).thenReturn(source);
+        when(mediaSubscriptionService.subscriptionsOf(7)).thenReturn(java.util.List.of());
+        when(mediaSubscriptionService.isSubscribedTitle(org.mockito.ArgumentMatchers.eq(7), org.mockito.ArgumentMatchers.eq("测试剧"), org.mockito.ArgumentMatchers.anyList())).thenReturn(true);
         when(mediaSubscriptionService.isSubscribedTitle(7, "测试剧")).thenReturn(true);
         when(mediaSubscriptionService.absoluteClientCover(any())).thenAnswer(inv -> inv.getArgument(0));
 
         mockMvc.perform(get("/media/token-a").param("t", "tmdb:tv_popular"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.list[0].vod_id").value("tmdb:tv:42"))
-                .andExpect(jsonPath("$.list[0].vod_remarks").value("已追 "));
+                .andExpect(jsonPath("$.list[0].vod_remarks").value("已追"));
     }
 
     @Test
@@ -119,6 +141,7 @@ class MediaLibraryControllerTest {
                 .andExpect(jsonPath("$.list[0].vod_play_url")
                         .value("📄 媒体信息$msubinfo-" + encode("tmdb:tv:42|测试剧")
                                 + "#🔍 全局搜索$msubsearch-" + encode("测试剧")
+                                + "#➕ 稍后再看$watchadd-" + encode("tmdb:tv:42|测试剧")
                                 + "#➕ 加入追剧$msubadd-" + encode("tmdb:tv:42|测试剧")));
     }
 
@@ -138,6 +161,7 @@ class MediaLibraryControllerTest {
                 .andExpect(jsonPath("$.list[0].vod_play_url")
                         .value("📄 媒体信息$msubinfo-" + encode("tmdb:tv:42|测试剧")
                                 + "#🔍 全局搜索$msubsearch-" + encode("测试剧")
+                                + "#➕ 稍后再看$watchadd-" + encode("tmdb:tv:42|测试剧")
                                 + "#➖ 取消·第1季$msubdel-" + encode("tmdb:tv:42|测试剧|1")
                                 + "#➕ 追剧·第5季$msubadd-" + encode("tmdb:tv:42|测试剧|5")))
                 .andExpect(jsonPath("$.list[0].ext").doesNotExist());
@@ -151,11 +175,72 @@ class MediaLibraryControllerTest {
         mockMvc.perform(get("/media/token-a").param("id", "s:showa"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.list[0].vod_name").value("showa"))
-                .andExpect(jsonPath("$.list[0].vod_remarks").value("已追 "))
+                .andExpect(jsonPath("$.list[0].vod_remarks").value("已追"))
                 .andExpect(jsonPath("$.list[0].vod_play_url")
                         .value("📄 媒体信息$msubinfo-" + encode("s:showa|showa")
                                 + "#🔍 全局搜索$msubsearch-" + encode("showa")
+                                + "#➕ 稍后再看$watchadd-" + encode("s:showa|showa")
                                 + "#➖ 取消追剧$msubdel-" + encode("s:showa|showa")));
+    }
+
+    @Test
+    void homeContentHidesWantCategoryWhenEmpty() throws Exception {
+        // mock 默认 count=0:稍后再看分类不出现,首屏顺序不变
+        when(pianDanService.subscriptionCategory()).thenReturn(new CategoryList());
+        mockMvc.perform(get("/media/token-a"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.class.length()").value(4))
+                .andExpect(jsonPath("$.class[1].type_id").value("active"));
+    }
+
+    @Test
+    void homeContentShowsWantCategoryAfterRecentWhenNonEmpty() throws Exception {
+        when(pianDanService.subscriptionCategory()).thenReturn(new CategoryList());
+        when(watchlistService.count(7)).thenReturn(3L);
+        mockMvc.perform(get("/media/token-a"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.class[1].type_id").value("want"))
+                .andExpect(jsonPath("$.class[1].type_name").value("稍后再看"))
+                .andExpect(jsonPath("$.class[2].type_id").value("active"));
+    }
+
+    @Test
+    void wantCategoryReturnsWatchlistWithSubscribedBadge() throws Exception {
+        MovieList watchlist = new MovieList();
+        MovieDetail item = new MovieDetail();
+        item.setVod_id("tmdb:tv:42");
+        item.setVod_name("测试剧");
+        item.setVod_pic("/images?url=x.jpg");
+        item.setVod_remarks("2024 · 8.5");
+        watchlist.getList().add(item);
+        when(watchlistService.content(7, 1)).thenReturn(watchlist);
+        when(mediaSubscriptionService.subscriptionsOf(7)).thenReturn(java.util.List.of());
+        when(mediaSubscriptionService.isSubscribedTitle(eq(7), eq("测试剧"), org.mockito.ArgumentMatchers.anyList())).thenReturn(true);
+        when(mediaSubscriptionService.absoluteClientCover(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        mockMvc.perform(get("/media/token-a").param("t", "want"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.list[0].vod_id").value("tmdb:tv:42"))
+                .andExpect(jsonPath("$.list[0].vod_remarks").value("已追 2024 · 8.5"));
+    }
+
+    @Test
+    void pianDanDetailShowsRemoveWatchWhenInWatchlist() throws Exception {
+        MovieDetail meta = new MovieDetail();
+        meta.setVod_id("tmdb:tv:42");
+        meta.setVod_name("测试剧");
+        when(pianDanService.tmdbDetail("tv", 42)).thenReturn(meta);
+        when(mediaSubscriptionService.isSubscribedTitle(org.mockito.ArgumentMatchers.eq(7), org.mockito.ArgumentMatchers.anyString())).thenReturn(false);
+        when(mediaSubscriptionService.absoluteClientCover(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(watchlistService.exists(7, "tmdb:tv:42")).thenReturn(true);
+
+        mockMvc.perform(get("/media/token-a").param("id", "tmdb:tv:42"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.list[0].vod_play_url")
+                        .value("📄 媒体信息$msubinfo-" + encode("tmdb:tv:42|测试剧")
+                                + "#🔍 全局搜索$msubsearch-" + encode("测试剧")
+                                + "#➖ 移出稍后再看$watchdel-" + encode("tmdb:tv:42|测试剧")
+                                + "#➕ 加入追剧$msubadd-" + encode("tmdb:tv:42|测试剧")));
     }
 
     private static String encode(String value) {
@@ -208,6 +293,8 @@ class MediaLibraryControllerTest {
         tmdb.getList().add(item);
         when(pianDanService.search("测试", 1, 24)).thenReturn(tmdb);
         when(mediaSubscriptionService.contentList(eq(7), isNull(), eq("测试"))).thenReturn(new MovieList());
+        when(mediaSubscriptionService.subscriptionsOf(7)).thenReturn(java.util.List.of());
+        when(mediaSubscriptionService.isSubscribedTitle(org.mockito.ArgumentMatchers.eq(7), org.mockito.ArgumentMatchers.eq("测试剧"), org.mockito.ArgumentMatchers.anyList())).thenReturn(true);
         when(mediaSubscriptionService.isSubscribedTitle(7, "测试剧")).thenReturn(true);
         when(mediaSubscriptionService.absoluteClientCover("https://image.tmdb.org/t/p/w500/x.jpg")).thenReturn("/images?url=x.jpg");
 

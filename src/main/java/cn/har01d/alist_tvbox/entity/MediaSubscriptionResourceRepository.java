@@ -9,6 +9,9 @@ import java.util.Optional;
 public interface MediaSubscriptionResourceRepository extends JpaRepository<MediaSubscriptionResource, Integer> {
     List<MediaSubscriptionResource> findBySubscriptionIdOrderByScoreDesc(int subscriptionId);
 
+    /** 批量版:多订阅资源一次取回(列表装配消 N+1,排序由调用方按 score 降序补齐)。 */
+    List<MediaSubscriptionResource> findBySubscriptionIdIn(java.util.Collection<Integer> subscriptionIds);
+
     /** 共享挂载守卫:该 share 是否仍被其它订阅的资源行引用。 */
     boolean existsByShareIdAndSubscriptionIdNot(Integer shareId, Integer subscriptionId);
 
@@ -16,6 +19,9 @@ public interface MediaSubscriptionResourceRepository extends JpaRepository<Media
     Optional<MediaSubscriptionResource> findFirstByShareIdOrderByIdAsc(Integer shareId);
 
     Optional<MediaSubscriptionResource> findBySubscriptionIdAndLink(int subscriptionId, String link);
+
+    /** 离线清理删除守卫:任意订阅里挂载同链接(磁力产物 link=offline:{产物名})的资源行。 */
+    List<MediaSubscriptionResource> findByLink(String link);
 
     /** 派生删除 = 先 select 再逐个 em.remove,必须在事务里执行(无外围事务的调用方会抛 TransactionRequiredException)。 */
     @Transactional

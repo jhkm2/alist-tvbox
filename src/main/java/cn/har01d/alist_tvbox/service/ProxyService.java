@@ -26,7 +26,6 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
@@ -34,6 +33,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -233,10 +233,12 @@ public class ProxyService {
         return Integer.parseInt(parts[1].split("\\.")[0]);
     }
 
-    private String buildAListProxyUrl(Site site, String path, String sign) {
+    String buildAListProxyUrl(Site site, String path, String sign) {
         if (site.getUrl().startsWith("http://localhost")) {
-            return ServletUriComponentsBuilder.fromCurrentRequest()
-                    .port(aListLocalService.getExternalPort())
+            // 此 URL 供服务端自取回源(downloadStraight),必须用进程内可达的内嵌 AList 地址(localhost:internalPort);
+            // externalPort(docker 下 ALIST_PORT=宿主映射端口)只对客户端直连有效——播放器从宿主机 127.0.0.1 连入时,
+            // 沿用请求 host 会拼出 127.0.0.1:{externalPort},容器内无人监听 → Connection refused(UC/百度/夸克全灭)
+            return UriComponentsBuilder.fromUriString("http://localhost:" + aListLocalService.getInternalPort())
                     .replacePath("/p" + path)
                     .replaceQuery(StringUtils.isBlank(sign) ? "" : "sign=" + sign)
                     .build()
@@ -262,9 +264,23 @@ public class ProxyService {
     public void downloadStraight(String url, HttpServletRequest request, HttpServletResponse response, Map<String, String> headers) throws IOException {
         HttpURLConnection urlConnection = openConnection(url, headers);
         urlConnection.setRequestMethod(request.getMethod());
-        response.setStatus(urlConnection.getResponseCode());
+        int status = urlConnection.getResponseCode();
+        response.setStatus(status);
         urlConnection.getHeaderFields().forEach((key, value) -> response.setHeader(key, value.get(0)));
-        copyAndCloseInput(urlConnection.getInputStream(), response.getOutputStream());
+        // 上游 4xx/5xx 时 getInputStream() 会抛异常,真实状态码和错误体(如夸克 CDN 412 风控页)
+        // 被 Spring 包成 500 白板、客户端无从辨别;改读 getErrorStream() 原样透传,并留一段日志便于排查
+        InputStream stream = status >= 400 ? urlConnection.getErrorStream() : urlConnection.getInputStream();
+        if (stream == null) {
+            return;
+        }
+        OutputStream output = response.getOutputStream();
+        if (status >= 400) {
+            byte[] prefix = stream.readNBytes(2048);
+            log.warn("proxy upstream {}: {} body={}", status, url,
+                    StringUtils.abbreviate(new String(prefix, StandardCharsets.UTF_8), 200));
+            output.write(prefix);
+        }
+        copyAndCloseInput(stream, output);
     }
 
     private static void copyAndCloseInput(InputStream is, OutputStream os) throws IOException {

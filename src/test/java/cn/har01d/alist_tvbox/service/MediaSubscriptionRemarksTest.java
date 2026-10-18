@@ -37,7 +37,7 @@ class MediaSubscriptionRemarksTest {
     private final MediaSubscriptionService service = new MediaSubscriptionService(
             subscriptionRepository, resourceRepository, null, null, episodeSourceRepository,
             null, null, null, null, null, null, checkService, null, settingRepository,
-            new AppProperties(), new ObjectMapper(), null, null);
+            new AppProperties(), new ObjectMapper(), null, null, null);
 
     private final MediaSubscription subscription = subscription();
 
@@ -131,6 +131,43 @@ class MediaSubscriptionRemarksTest {
 
         String text = service.subscriptionStatusText(1, 7);
         assertFalse(text.contains("官方已播"), "官方快照缺失不臆测: " + text);
+    }
+
+    @Test
+    void statusTextIncludesNextAirWithWeekday() {
+        // 2026-09-05 是周六,20:00 北京时间 —— 周播剧的周几是更新锚点,文案必须带出
+        subscription.setNextAirTime(java.time.ZonedDateTime.of(2026, 9, 5, 20, 0, 0, 0,
+                        java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli());
+        Mockito.when(subscriptionRepository.findById(7)).thenReturn(Optional.of(subscription));
+
+        String text = service.subscriptionStatusText(1, 7);
+        assertTrue(text.contains("下集播出:09-05 周六 20:00"), text);
+    }
+
+    @Test
+    void statusTextOmitsNextAirWhenEnded() {
+        subscription.setStatus(MediaSubscription.STATUS_ENDED);
+        subscription.setNextAirTime(System.currentTimeMillis() + 3600_000L);
+        Mockito.when(subscriptionRepository.findById(7)).thenReturn(Optional.of(subscription));
+
+        String text = service.subscriptionStatusText(1, 7);
+        assertFalse(text.contains("下集播出"), "完结剧无下集播出: " + text);
+    }
+
+    @Test
+    void statusTextIncludesManualUpdateDays() {
+        subscription.setAirWeekdays("2,4");
+        Mockito.when(subscriptionRepository.findById(7)).thenReturn(Optional.of(subscription));
+
+        String text = service.subscriptionStatusText(1, 7);
+        assertTrue(text.contains("更新日:周二、周四"), text);
+    }
+
+    @Test
+    void serializeAirWeekdaysRoundTrip() {
+        assertEquals("2,4", MediaSubscriptionService.serializeAirWeekdays(List.of(4, 2, 2)));
+        assertNull(MediaSubscriptionService.serializeAirWeekdays(java.util.Arrays.asList(8, 0, null)), "全非法归 null(未配置)");
+        assertNull(MediaSubscriptionService.serializeAirWeekdays(null));
     }
 
     @Test

@@ -41,15 +41,20 @@ public class MediaSubscriptionResource {
     /** 用户手动移除(终态墓碑:保留行防重复入池,不参与冷却重探/自动换源;恢复走 restore) */
     public static final String STATE_REMOVED = "REMOVED";
 
-    /** 退役原因分类:链接失效/异剧(确定性不符)→ 长冷却;瞬时故障连击达上限 → 短冷却快重探 */
+    /** 退役原因分类:链接失效/异剧(确定性不符)→ 长冷却;瞬时故障连击达上限 → 短冷却快重探;
+     *  体积筛选不符 → 长冷却(用户调配置后冷却期满重探自愈) */
     public static final String FAIL_KIND_DEAD = "DEAD";
     public static final String FAIL_KIND_ALIEN = "ALIEN";
     public static final String FAIL_KIND_TRANSIENT = "TRANSIENT";
+    public static final String FAIL_KIND_POLICY = "POLICY";
     /** 来源标记:用户手动粘贴分享链接入池(区别于搜索自动发现)——豁免入池/探测的自动门禁(盘白名单/年份/标题/排除词)。 */
     public static final String SOURCE_MANUAL = "manual";
     /** 来源标记:磁力离线产物(非分享链接,shareId 恒 null,link 形如 offline:{产物名})——
      *  不参与普通候选探测/挂载槽位/换血/同盘回收,维护由磁力收割对账承担。 */
     public static final String SOURCE_MAGNET = "magnet";
+    /** 来源标记:115 自有永久分享(批次快照:转存到自有 115 盘建分享后源文件已删)——
+     *  快照不可变,豁免死链判死/补缺重列/同盘回收;新集靠新批次,不从这些行增量。 */
+    public static final String SOURCE_SELF_115 = "self115";
 
     @Id
     @GeneratedValue(strategy = GenerationType.TABLE, generator = "tableGenerator")
@@ -122,8 +127,9 @@ public class MediaSubscriptionResource {
     @Column(name = "fail_kind", length = 16)
     private String failKind;
 
-    /** 手动钉选(用户指定主源):换源候选序置顶、归属复核豁免(用户否决自动判定);
-     * 每订阅至多一个,失效退役不清除 —— 恢复可用后优先回归。null 视为未钉选。 */
+    /** 手动钉选(用户指定主源):换源候选序置顶、异剧/时长/归属复核全链路豁免(用户否决自动判定,
+     * 不因内容门禁退役/卸载);每订阅至多一个,链接真死的失效退役不清除 —— 恢复可用后优先回归。
+     * null 视为未钉选。 */
     private Boolean pinned;
 
     /**

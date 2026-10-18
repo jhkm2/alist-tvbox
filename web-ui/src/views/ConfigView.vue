@@ -69,6 +69,15 @@
               />
               <span class="hint">建议外网开启，多个安全Token，逗号分割。</span>
             </el-form-item>
+            <el-form-item prop="anonymousAccess" label="亲友共享">
+              <el-switch
+                v-model="form.anonymousAccess"
+                inline-prompt
+                active-text="开启"
+                inactive-text="关闭"
+              />
+              <span class="hint">开启安全订阅后，无Token的旧订阅地址仍可访问，且配置内自动注入首个安全Token，亲友无需改地址。</span>
+            </el-form-item>
             <el-form-item prop="token" label="安全Token">
               <el-input v-model="form.token" type="password" show-password/>
             </el-form-item>
@@ -212,17 +221,20 @@
             <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">到官网获取 →</a>
           </span>
         </el-form-item>
-        <el-form-item label="TMDB 线路">
+        <el-form-item label="TMDB 代理">
           <el-select v-model="tmdbApiHost" style="width: 320px"
                     filterable allow-create default-first-option
                     placeholder="选择预设,或输入自定义 CF Worker 反代地址">
             <el-option v-for="opt in tmdbApiHostOptions" :key="opt.value" :label="opt.label" :value="opt.value"/>
           </el-select>
-          <el-button type="primary" @click="updateTmdbApiHost">更新</el-button>
-          <span class="hint" style="margin-left: 8px">国内直连官方不通时切换反代;Worker 轮询池分摊各 worker 每日限额,Worker 型 API 与封面同域,NAStool 型自动分开配置图床,立即生效</span>
+          <el-button type="primary" class="hint" @click="updateTmdbApiHost">更新</el-button>
+          <span class="hint" style="margin-left: 8px">可以手动输入代理地址，立即生效;多个地址逗号分隔自动轮询;
+            <a href="/tmdb_proxy_worker.js" target="_blank" rel="noopener">自建 Worker 参考代码 →</a>
+          </span>
         </el-form-item>
         <el-form-item label="115分享本地索引" v-if="has115Account">
           <el-button type="primary" :loading="index115Loading" @click="updateIndex115">下载</el-button>
+          <el-button :loading="index115ForceLoading" @click="forceUpdateIndex115">强制更新</el-button>
           <el-tag v-if="index115Checking" type="info" style="margin-left: 8px">检查中</el-tag>
           <el-tag v-else-if="index115Check.error" type="danger" style="margin-left: 8px">检查失败</el-tag>
           <el-tag v-else-if="index115Check.hasUpdate" type="warning" style="margin-left: 8px">有更新</el-tag>
@@ -251,6 +263,15 @@
         <el-form-item label="夸克TV机器码">
           <el-input v-model="quarkDeviceId" style="width: 300px" type="text"/>
           <el-button type="primary" class="hint" @click="updateQuarkDeviceId">更新</el-button>
+        </el-form-item>
+        <el-form-item label="信任反代">
+          <el-input v-model="trustedProxies" style="width: 300px" type="text"
+                    placeholder="留空=始终采信转发头;配置后仅列表内地址的转发头被采信"/>
+          <el-button type="primary" class="hint" @click="updateTrustedProxies">更新</el-button>
+          <div class="hint" style="width: 100%">
+            逗号分隔的反代地址(精确 IP 或 192.168.50./* 前缀)。留空维持默认:始终采信 X-Forwarded-For;
+            配置后其它来源的请求一律按 TCP 对端地址记客户端 IP(登录限速/日志/播放同步按此口径)。
+          </div>
         </el-form-item>
         <el-form-item label="Cookie地址">
           <a :href="currentUrl + '/ali/token/' + aliSecret" target="_blank">
@@ -413,7 +434,7 @@ const options = [
     ]
   }
 ]
-const tooltip = ref('sudo bash -c "$(curl -fsSL https://d.har01d.cn/alist-tvbox.sh)"')
+const tooltip = ref('curl -fsSL http://d.har01d.cn/alist-tvbox.sh | sudo bash')
 const aListStarted = ref(false)
 const aListRestart = ref(false)
 const mixSiteSource = ref(false)
@@ -425,6 +446,7 @@ const autoCheckin = ref(false)
 const dialogVisible = ref(false)
 const has115Account = ref(false)
 const index115Loading = ref(false)
+const index115ForceLoading = ref(false)
 const index115Checking = ref(false)
 const index115Check = ref<{hasAccount: boolean, hasUpdate: boolean, localVersion: string, remoteVersion: string, error: string | null}>({hasAccount: false, hasUpdate: false, localVersion: '', remoteVersion: '', error: null})
 const changelog = ref('')
@@ -446,10 +468,12 @@ const tmdbApiKey = ref('')
 const tmdbApiHost = ref('')
 const tmdbApiHostOptions = [
   {label: '官方 API(直连)', value: ''},
-  {label: 'Worker 轮询池 - round robin 分摊每日限额', value: 'https://tmdb.8866033.xyz,https://tmdb.swust-oj.workers.dev,https://tmdb.8866033.workers.dev,https://tmdb.power348045.workers.dev,https://tmdb.harold348047.workers.dev,https://tmdb.ai-09b.workers.dev,https://tmdb.root-df0.workers.dev,https://tmdb.atv-8c1.workers.dev,https://tmdb.odd-math-a42b.workers.dev,https://tmdb.test-d2c.workers.dev,https://tmdb.code-a96.workers.dev,https://tmdb.claude-b79.workers.dev'},
-  {label: 'NAStool(API + 图床分线路,自动配置)', value: 'https://tmdb.nastool.org'},
+  {label: 'Worker 轮询池 - round robin', value: 'worker-pool'},
+  {label: 'itv666 代理', value: 'http://tmdb.itv666.cc'},
+  {label: 'NAStool 代理', value: 'https://tmdb.nastool.org'},
 ]
 const userAgent = ref('')
+const trustedProxies = ref('')
 const atvPass = ref('')
 const apiKey = ref('')
 const basicAuthUser = ref('')
@@ -466,7 +490,8 @@ const login = ref({
 
 const form = ref({
   token: '',
-  enabledToken: true
+  enabledToken: true,
+  anonymousAccess: false
 })
 
 const formatTime = (value: string | number) => {
@@ -570,6 +595,12 @@ const setUserAgent = () => {
 const updateUserAgent = (value: string) => {
   axios.post('/api/settings', {name: 'user_agent', value: value}).then(({data}) => {
     userAgent.value = data.value
+    ElMessage.success('更新成功')
+  })
+}
+
+const updateTrustedProxies = () => {
+  axios.post('/api/settings', {name: 'trusted_proxies', value: trustedProxies.value}).then(() => {
     ElMessage.success('更新成功')
   })
 }
@@ -732,6 +763,17 @@ const updateIndex115 = () => {
   })
 }
 
+const forceUpdateIndex115 = () => {
+  index115ForceLoading.value = true
+  axios.post('/api/index115/force').then(() => {
+    ElMessage.success('115索引强制更新完成')
+  }).catch((e) => {
+    ElMessage.error('115索引强制更新失败：' + (e?.response?.data?.message || e.message))
+  }).finally(() => {
+    index115ForceLoading.value = false
+  })
+}
+
 onMounted(() => {
   axios.get('/api/basic-auth-credentials').then(({data}) => {
     basicAuthUser.value = data.username
@@ -740,6 +782,7 @@ onMounted(() => {
   axios.get('/api/settings').then(({data}) => {
     form.value.token = data.token
     form.value.enabledToken = data.enabled_token === 'true'
+    form.value.anonymousAccess = data.anonymous_access === 'true'
     scheduleTime.value = data.schedule_time || new Date(2023, 6, 20, 9, 0)
     aListStartTime.value = data.alist_start_time
     movieVersion.value = data.movie_version
@@ -753,6 +796,7 @@ onMounted(() => {
     tmdbApiKey.value = data.tmdb_api_key
     tmdbApiHost.value = data.tmdb_api_host || ''
     userAgent.value = data.user_agent
+    trustedProxies.value = data.trusted_proxies || ''
     autoCheckin.value = data.auto_checkin === 'true'
     aListRestart.value = data.alist_restart_required === 'true'
     replaceAliToken.value = data.replace_ali_token === 'true'
@@ -769,9 +813,9 @@ onMounted(() => {
     login.value.password = data.alist_password
     login.value.enabled = data.alist_login === 'true'
     if (store.standalone) {
-      tooltip.value = 'bash -c "$(curl -fsSL http://d.har01d.cn/install-service.sh)"'
+      tooltip.value = 'curl -fsSL http://d.har01d.cn/install-service.sh | sudo bash'
     } else {
-      tooltip.value = 'sudo bash -c "$(curl -fsSL http://d.har01d.cn/alist-tvbox.sh)" -s update'
+      tooltip.value = 'curl -fsSL http://d.har01d.cn/alist-tvbox.sh | sudo bash -s -- update -y'
     }
   })
   axios.get('/api/alist/status').then(({data}) => {

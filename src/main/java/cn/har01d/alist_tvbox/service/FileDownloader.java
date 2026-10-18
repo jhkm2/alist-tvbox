@@ -51,10 +51,10 @@ public class FileDownloader {
     private static final String REMOTE_DIFF_ZIP_URL = BASE_URL + "diff.zip";
     private static final String PG_LATEST_URL = "https://github.com/power721/PG/releases/latest";
     private static final String ZX_LATEST_URL = "https://github.com/power721/ZX/releases/latest";
-    private static final String SYNC_BASE_URL = "https://8866033.xyz/";
-    private static final String XS_INDEX_URL = SYNC_BASE_URL + "xs.txt";
-    private static final String XS_VERSION_URL = SYNC_BASE_URL + "xs.version.txt";
+    // xs 同步产物(xs.txt/xs.version.txt)地址;8866033.xyz 已失效,固定 d.har01d.cn
+    private static final List<String> XS_SYNC_BASES = List.of(BASE_URL);
     private static final String XS_USER_AGENT = "okhttp/5.3.2";
+    private static final ObjectMapper XS_MAPPER = new ObjectMapper();
 
     private static final Set<String> GITHUB_PROXY = Set.of("https://slink.ltd/", "https://cors.zme.ink/", "https://git.886.be/", "https://gitdl.cn/", "https://ghfast.top/", "https://ghproxy.net/", "https://github.moeyy.xyz/", "https://gh-proxy.com/", "https://ghproxy.cc/", "https://gh.llkk.cc/", "https://gh.ddlc.top/", "https://gh-proxy.llyke.com/");
 
@@ -82,16 +82,14 @@ public class FileDownloader {
 
     private final TaskService taskService;
     private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper;
 
-    public FileDownloader(TaskService taskService, RestTemplateBuilder builder, GitHubProxyService gitHubProxyService, ObjectMapper objectMapper) {
+    public FileDownloader(TaskService taskService, RestTemplateBuilder builder, GitHubProxyService gitHubProxyService) {
         this.taskService = taskService;
         this.restTemplate = builder
                 .connectTimeout(Duration.ofSeconds(5))
                 .readTimeout(Duration.ofSeconds(10))
                 .build();
         this.gitHubProxyService = gitHubProxyService;
-        this.objectMapper = objectMapper;
         pgVersionFile = Utils.getDataPath("pg_version.txt");
         zxBaseVersionFile = Utils.getDataPath("zx_base_version.txt");
         zxVersionFile = Utils.getDataPath("zx_version.txt");
@@ -218,6 +216,8 @@ public class FileDownloader {
             log.debug("download PG file {}", remoteVersion);
             String baseUrl = "https://github.com/power721/pg/releases/download/" + remoteVersion + "/pg." + remoteVersion + ".zip";
             List<String> urls = getDownloadUrls(baseUrl);
+            boolean success = false;
+            Exception lastError = null;
             for (String url : urls) {
                 try {
                     downloadFile(url, pgZip);
@@ -231,10 +231,16 @@ public class FileDownloader {
 
                     log.debug("save PG version: {}", remoteVersion);
                     saveVersion(pgVersionFile, remoteVersion);
+                    success = true;
                     break;
                 } catch (Exception e) {
                     log.warn("download pg {} failed", url, e);
+                    lastError = e;
                 }
+            }
+            if (!success) {
+                // 全部下载源失败必须上抛:吞掉则 executeWithRetry 捕不到异常,任务假成功且不再重试
+                throw new IOException("download PG " + remoteVersion + " failed from " + urls.size() + " urls", lastError);
             }
         }
 
@@ -257,6 +263,8 @@ public class FileDownloader {
             log.debug("download zx diff {}", remoteVersion);
             String baseUrl = "https://github.com/power721/ZX/releases/download/" + remoteVersion + "/zx" + remoteVersion + ".zip";
             List<String> urls = getDownloadUrls(baseUrl);
+            boolean success = false;
+            Exception lastError = null;
             for (String url : urls) {
                 try {
                     downloadFile(url, zxZip);
@@ -268,10 +276,16 @@ public class FileDownloader {
                     unzipFile(zxZip, zxWebDir);
 
                     saveVersion(zxVersionFile, remoteVersion);
+                    success = true;
                     break;
                 } catch (Exception e) {
                     log.warn("download zx {} failed", url, e);
+                    lastError = e;
                 }
+            }
+            if (!success) {
+                // 全部下载源失败必须上抛:吞掉则 executeWithRetry 捕不到异常,任务假成功且不再重试
+                throw new IOException("download ZX " + remoteVersion + " failed from " + urls.size() + " urls", lastError);
             }
         }
 
@@ -287,8 +301,37 @@ public class FileDownloader {
 
         log.info("local xs: {}, remote xs: {}", localVersion, remoteVersion);
 
+        if (remoteVersion.isEmpty()) {
+            // getXsVersion 拉取失败返回空串；空串与任何本地版本不等，若继续下载会把空版本落盘，
+            // 之后 getLocalVersion 读 0 字节文件越界，更新从此永久失败
+            throw new IOException("xs remote version is empty");
+        }
+
         if (!localVersion.equals(remoteVersion)) {
-            String downloadUrl = getXsDownloadUrl();
+            // xs.txt 多行指针按序尝试：首行上游原始地址（省镜像带宽），失败回退后续镜像。
+            // 单候选失败不抛——同一网络下其余候选可能可达（如路由器过滤只拦上游域）
+            List<String> candidates = resolveXsUrls();
+            Exception lastError = null;
+            for (String url : candidates) {
+                try {
+                    updateXsFrom(url, remoteVersion);
+                    taskService.completeTask(task.getId(), "文件下载成功", remoteVersion);
+                    return;
+                } catch (Exception e) {
+                    lastError = e;
+                    log.warn("xs update from {} failed, trying next candidate", url, e);
+                }
+            }
+            throw new IOException("xs update failed from " + candidates.size() + " candidates " + candidates, lastError);
+        }
+
+        taskService.completeTask(task.getId(), "文件下载成功", remoteVersion);
+    }
+
+    private void updateXsFrom(String url, String remoteVersion) throws IOException {
+        String content = decryptXsContent(getRemoteText(url, XS_USER_AGENT));
+        String downloadUrl = findXsZipUrl(content);
+        if (downloadUrl != null) {
             log.debug("download xs file {} from {}", remoteVersion, downloadUrl);
             downloadFile(downloadUrl, xsZip, XS_USER_AGENT);
 
@@ -298,12 +341,12 @@ public class FileDownloader {
 
             log.debug("unzip xs file to {}", xsWebDir);
             unzipFile(xsZip, xsWebDir);
-
-            log.debug("save xs version: {}", remoteVersion);
-            saveVersion(xsVersionFile, remoteVersion);
+        } else {
+            writeXsInterface(content);
         }
 
-        taskService.completeTask(task.getId(), "文件下载成功", remoteVersion);
+        log.debug("save xs version: {}", remoteVersion);
+        saveVersion(xsVersionFile, remoteVersion);
     }
 
     public String getPgVersion() {
@@ -326,41 +369,104 @@ public class FileDownloader {
 
     public String getXsVersion() {
         try {
-            return getRemoteVersion(XS_VERSION_URL);
+            return fetchXsSyncText("xs.version.txt").trim();
         } catch (IOException e) {
             log.warn("getXsVersion IOException", e);
         }
         return "";
     }
 
-    private String getXsDownloadUrl() throws IOException {
-        String json = getRemoteText(resolveXsSingleUrl(), XS_USER_AGENT);
-        var root = objectMapper.readTree(json);
-        for (var section : root) {
-            if ("本地包".equals(section.path("name").asText())) {
-                for (var item : section.path("list")) {
-                    if ("点击下载".equals(item.path("name").asText())) {
-                        String url = item.path("url").asText();
-                        if (!url.isEmpty()) {
-                            return url;
+    /**
+     * 潇洒接口可能是市场 JSON（数组，含「本地包/点击下载」zip 地址），
+     * 也可能是完整配置 JSON（对象，含 sites）；后者直接落盘为本地包配置。
+     */
+    static String findXsZipUrl(String json) {
+        if (json == null) {
+            return null;
+        }
+        try {
+            var root = XS_MAPPER.readTree(json);
+            if (!root.isArray()) {
+                return null;
+            }
+            for (var section : root) {
+                if ("本地包".equals(section.path("name").asText())) {
+                    for (var item : section.path("list")) {
+                        if ("点击下载".equals(item.path("name").asText())) {
+                            String url = item.path("url").asText();
+                            if (!url.isEmpty()) {
+                                return url;
+                            }
                         }
                     }
                 }
             }
+        } catch (Exception e) {
+            return null;
         }
-        throw new IOException("Cannot find xs download url from single.json");
+        return null;
     }
 
-    static String parseXsSingleUrl(String text) {
+    // 2423 开头的 hex 是 FongMi 系「$#密钥#$」加密接口（如 sun.json），算法同 SubscriptionService.convertResult
+    static String decryptXsContent(String content) {
+        if (content == null) {
+            return null;
+        }
+        String text = content.replaceAll("\\s+", "");
+        if (!text.startsWith("2423")) {
+            return content;
+        }
+        String ascii = new String(hexToBytes(text), StandardCharsets.ISO_8859_1).toLowerCase();
+        int start = ascii.indexOf("$#");
+        int end = ascii.indexOf("#$", start + 2);
+        if (start < 0 || end < 0) {
+            throw new IllegalArgumentException("encrypted xs content missing $#...#$ key marker");
+        }
+        String key = SubscriptionService.rightPadding(ascii.substring(start + 2, end), "0", 16);
+        String iv = SubscriptionService.rightPadding(ascii.substring(ascii.length() - 13), "0", 16);
+        String data = text.substring(text.indexOf("2324") + 4, text.length() - 26);
+        return SubscriptionService.CBC(data, key, iv);
+    }
+
+    private static byte[] hexToBytes(String src) {
+        int l = src.length() / 2;
+        byte[] ret = new byte[l];
+        for (int i = 0; i < l; i++) {
+            ret[i] = Integer.valueOf(src.substring(i * 2, i * 2 + 2), 16).byteValue();
+        }
+        return ret;
+    }
+
+    private void writeXsInterface(String content) throws IOException {
+        var root = content == null ? null : XS_MAPPER.readTree(content);
+        if (root == null || !root.isObject() || !root.has("sites")) {
+            throw new IOException("xs.txt target is neither market json with 本地包/点击下载 nor config json with sites");
+        }
+        deleteDirectory(xsWebDir);
+        Path target = xsWebDir.resolve(Paths.get("TVBoxOSC", "tvbox", "api.json"));
+        Files.createDirectories(target.getParent());
+        Files.writeString(target, content);
+        log.info("wrote xs interface config to {}", target);
+    }
+
+    /**
+     * xs.txt 多行指针：每行一个地址，按序尝试（首行原始地址，后续行为镜像回退）。
+     * 兼容单行历史格式；返回前去重保序。
+     */
+    static List<String> parseXsUrls(String text) {
+        List<String> urls = new ArrayList<>();
         if (text != null) {
             for (String line : text.split("\\R")) {
                 String s = line.trim();
-                if (!s.isEmpty()) {
-                    return s;
+                if (!s.isEmpty() && !urls.contains(s)) {
+                    urls.add(s);
                 }
             }
         }
-        throw new IllegalStateException("xs.txt 内容为空");
+        if (urls.isEmpty()) {
+            throw new IllegalStateException("xs.txt 内容为空");
+        }
+        return urls;
     }
 
     // HttpURLConnection 不做 URL 编码：路径含非 ASCII（如上游 zip 名「单线路」）时原样 UTF-8 字节进请求行，
@@ -381,8 +487,21 @@ public class FileDownloader {
         }
     }
 
-    private String resolveXsSingleUrl() throws IOException {
-        return parseXsSingleUrl(getRemoteText(XS_INDEX_URL, XS_USER_AGENT));
+    private List<String> resolveXsUrls() throws IOException {
+        return parseXsUrls(fetchXsSyncText("xs.txt"));
+    }
+
+    private String fetchXsSyncText(String name) throws IOException {
+        IOException last = null;
+        for (String base : XS_SYNC_BASES) {
+            try {
+                return getRemoteText(base + name, XS_USER_AGENT);
+            } catch (IOException e) {
+                log.warn("fetch {} from {} failed", name, base, e);
+                last = e;
+            }
+        }
+        throw last;
     }
 
     private String getGitHubVersion(String name, String url, Pattern pattern) {
@@ -480,9 +599,13 @@ public class FileDownloader {
         taskService.completeTask(task.getId(), "文件下载成功", remoteVersion);
     }
 
-    private String getLocalVersion(Path path, String defaultValue) throws IOException {
+    static String getLocalVersion(Path path, String defaultValue) throws IOException {
         if (Files.exists(path)) {
-            return Files.readAllLines(path).get(0).trim();
+            var lines = Files.readAllLines(path);
+            // 版本文件可能被写成 0 字节（曾因空远程版本落盘），get(0) 越界会让下载任务永久卡死
+            if (!lines.isEmpty() && !lines.get(0).isBlank()) {
+                return lines.get(0).trim();
+            }
         }
         return defaultValue;
     }
@@ -640,11 +763,18 @@ public class FileDownloader {
     private void unzipWithSystemCommand(Path zipFile, Path destDir) throws IOException, InterruptedException {
         log.info("Unzip by linux command: {}", zipFile);
         ProcessBuilder pb = new ProcessBuilder("unzip", "-o", zipFile.toString(), "-d", destDir.toString());
+        // unzip 把每个解压文件名打到 stdout,不排空超管道缓冲(~64KB)子进程就写阻塞、waitFor 永不返回;
+        // 单线程下载 executor 被卡死后所有 pg/zx/xs/movie 任务堆积 —— 文件名对我们无用,直接丢弃并加超时兜底
+        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         Process process = pb.start();
 
         String errorOutput = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
 
-        int exitCode = process.waitFor();
+        if (!process.waitFor(10, TimeUnit.MINUTES)) {
+            process.destroyForcibly();
+            throw new IOException("System unzip timeout: " + zipFile);
+        }
+        int exitCode = process.exitValue();
         if (exitCode != 0) {
             throw new IOException("System unzip failed with code " + exitCode + ": " + errorOutput);
         }

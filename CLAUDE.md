@@ -164,7 +164,7 @@ npm run lint
 - Save all documents to folder docs/
 - Save security related documents to folder docs/security/
 
-# 关联代码仓库
+# 9. 关联代码仓库
 - PowerList（AList）： /home/harold/GolandProjects/PowerList
 - TG-search： /home/harold/workspace/telegram-search
 - TvBox爬虫（spring.jar）： /home/harold/workspace/CatVodTVSpider
@@ -179,3 +179,25 @@ npm run lint
 - 版本同步、包同步： /home/harold/GolandProjects/atv-sync
 - 阿里云盘Open Token： /home/harold/GolandProjects/AliToken
 - 115云盘驱动： /home/harold/GolandProjects/115driver
+
+# 10. Docker mounts
+host to docker container
+- /opt/alist-tvbox to /data
+- /opt/alist-tvbox/www-static to /www/static
+
+## database
+/opt/alist-tvbox/atv.mv.db
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues (`power721/alist-tvbox`) via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Defaults kept: `needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.

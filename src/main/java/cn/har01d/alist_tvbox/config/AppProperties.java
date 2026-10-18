@@ -16,8 +16,14 @@ import java.util.Set;
 @ConfigurationProperties("app")
 public class AppProperties {
     private boolean hostmode;
+    // 镜像级小雅信号:xiaoya/host profile 的 application-*.yaml 置 true(小雅系镜像 CMD 恒激活),
+    // 与站点表的 xiaoya 标志(用户级,网页可改)互补,共同构成豆瓣 meta 数据集门禁
+    private boolean xiaoya;
     private boolean supportDash;
     private boolean heartbeat;
+    // B站详情点赞/投币/收藏条目展示位:false=并入第一条 BiliBili 线路(默认,选集网格直接可见);
+    // true=单独「操作」线路(置于线路末位)。Setting 键 bilibili_action_separate_line
+    private boolean actionSeparateLine;
     private boolean sort;
     private boolean merge;
     private boolean mix;
@@ -28,6 +34,15 @@ public class AppProperties {
     private boolean enabledToken;
     // 直播平台首页热门展示方式:mix=热门直播间混排在分类文件夹前;folder=入口为"热门直播间"文件夹;none=仅分类文件夹
     private String liveHotMode = "folder";
+    // 隐藏的直播平台 type 列表:不进平台分类/聚合搜索/关注筛选,detail 保留(已关注房间仍可直达播放)。
+    // 花椒已随 pure_live 3.1.6 下线(公域 feed 实测 0 房间),服务整体移除,历史关注行仍可读(标「已下线」)。
+    private List<String> liveHiddenPlatforms = List.of();
+    // 平台展示顺序(live_platform_order):配置的平台按序在前,未列入的新平台按注册序追加
+    private List<String> livePlatformOrder = List.of();
+    // 直播流代理模式:proxy=流地址全部经本服务代理中转(断流自动续租无感,消耗服务器带宽);
+    // dual=「直连优先+代理」双线路,客户端默认直连平台 CDN(零服务器带宽),直连失败由内核自动
+    // 落到代理(OK影视切下一集/FongMi切线路均兼容;网页端不受影响恒走代理)。默认直连优先省带宽
+    private String liveProxyMode = "dual";
     private boolean playbackSyncEnabled = false;
     // 同步分区粒度:uid(不分桶)/ token(按 vod token)/ subscription(按 vod token/id)
     private String playbackSyncScope = "token";
@@ -129,6 +144,8 @@ public class AppProperties {
         private int maxTransfersPerDay = 20;
         /** 自动转存:单轮转存等待 AList copy 任务完成的超时(分钟) */
         private int transferTimeoutMinutes = 30;
+        /** 115 自有分享:每订阅每日建分享(批次)次数上限,防 115 分享接口风控 */
+        private int selfShareDailyLimit = 3;
         /** 新集播放预热验证:发现新集时做链接解析探测,失败判损坏(被和谐)登记补源 */
         private boolean preheatEnabled = true;
         /** 新集播放预热验证:每轮最多探测的集数 */
@@ -163,10 +180,13 @@ public class AppProperties {
         private int probeTransientStreak = 3;
         /** 失效黑名单窗口(天):窗口外的判死记录不再拦截入池,该链可重新试错一次(再判死刷新时间) */
         private int deadLinkTtlDays = 90;
-        /** 玩偶聚合搜索源(玩偶/多多/木偶等 11 站聚合,搜索+详情页提取分享链接):追剧候选池补充来源 */
+        /** 玩偶聚合搜索源(玩偶/多多/木偶等 10 站聚合,搜索+详情页提取分享链接):追剧候选池补充来源 */
         private boolean wanouEnabled = true;
-        /** 玩偶聚合:站点最新域名监控接口(空=只用内置静态域名) */
-        private String wanouMonitorUrl = "https://pan-site-monitor.douer.me/api/data";
+        /** 玩偶聚合:站点最新域名监控接口(可选;默认空=不拉,种子+内置探测已覆盖。pan-site-monitor
+         *  2026-09 起停更,下发域名无增量还注入死 IP,恢复更新后可显式配置启用) */
+        private String wanouMonitorUrl = "";
+        /** 玩偶聚合:内置定时域名探测(可达性+延迟,自动采用延迟最低的可达域名);监控接口仅作新域名来源 */
+        private boolean wanouProbeEnabled = true;
         /** 玩偶聚合:单站每次搜索最多抓取的详情页数 */
         private int wanouMaxDetailPages = 3;
         /** 玩偶聚合:整源搜索总超时(秒) */
@@ -222,6 +242,19 @@ public class AppProperties {
         private int magnetCooldownHours = 24;
         /** 磁力兜底超时重查间隔(小时):SUBMITTED 任务网盘侧还在下载,到期前不再提交新磁力 */
         private int magnetPendingRecheckHours = 12;
+        /** 离线自动清理:滞留 PENDING 判定阈值(天)——提交超该天数且 115 侧仍在下载(或无 btih
+         *  对不上任务列表)才按滞留清任务+文件,顺带释放 app 侧 pending 闸门占位 */
+        private int offlinePendingStuckDays = 7;
+        /** 采集源兜底(部署级默认;用户开关走 Setting msub_collection_fallback):候选源全灭时
+         *  播放链路最后一级从 MacCMS 采集站(资源聚合精选 8 站)搜索直链补集「当前集+后3集」。
+         *  结果只落 msub_episode_fallback 覆盖层,不改写原始追剧数据 */
+        private boolean collectionFallbackEnabled = false;
+        /** 采集源兜底:8 站并行搜索/单站详情请求总超时(秒) */
+        private int collectionFallbackTimeoutSeconds = 10;
+        /** 采集源兜底:搜索无结果/匹配失败的负缓存(分钟),窗口内不重搜 */
+        private int collectionFallbackNegativeTtlMinutes = 30;
+        /** 采集源兜底:补集行 TTL(小时),过期出局重新采集(永不续期) */
+        private int collectionFallbackRowTtlHours = 72;
     }
 
     public static Map<String, Map<String, Object>> copyLocalProxyConfig(Map<String, Map<String, Object>> source) {

@@ -3,8 +3,10 @@ package cn.har01d.alist_tvbox.service;
 import cn.har01d.alist_tvbox.auth.TokenService;
 import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.dto.playback.PlaybackDeleteInput;
+import cn.har01d.alist_tvbox.dto.playback.PlaybackScopeDto;
 import cn.har01d.alist_tvbox.dto.playback.PlaybackSyncInput;
 import cn.har01d.alist_tvbox.dto.playback.PlaybackSyncPage;
+import cn.har01d.alist_tvbox.dto.playback.PlaybackTokenDto;
 import cn.har01d.alist_tvbox.entity.History;
 import cn.har01d.alist_tvbox.entity.HistoryRepository;
 import cn.har01d.alist_tvbox.entity.PlaybackToken;
@@ -13,6 +15,8 @@ import cn.har01d.alist_tvbox.entity.PlaybackChangeSequence;
 import cn.har01d.alist_tvbox.entity.PlaybackChangeSequenceRepository;
 import cn.har01d.alist_tvbox.entity.PlaybackTombstone;
 import cn.har01d.alist_tvbox.entity.PlaybackTombstoneRepository;
+import cn.har01d.alist_tvbox.entity.Subscription;
+import cn.har01d.alist_tvbox.entity.SubscriptionRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -25,6 +29,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -58,6 +63,8 @@ class PlaybackSyncServiceTest {
     @Mock
     private PlaybackChangeSequenceRepository changeSequenceRepository;
     @Mock
+    private SubscriptionRepository subscriptionRepository;
+    @Mock
     private TokenService tokenService;
     @Mock
     private ProxyService proxyService;
@@ -74,8 +81,8 @@ class PlaybackSyncServiceTest {
         appProperties = new AppProperties();
         appProperties.setPlaybackSyncEnabled(true);
         service = new PlaybackSyncService(
-                historyRepository, tokenRepository, tombstoneRepository, changeSequenceRepository, tokenService,
-                appProperties, proxyService);
+                historyRepository, tokenRepository, tombstoneRepository, changeSequenceRepository,
+                subscriptionRepository, tokenService, appProperties, proxyService);
     }
 
     /** uid 级身份(syncScope=null):沿用旧行为,所有订阅互通。 */
@@ -448,6 +455,99 @@ class PlaybackSyncServiceTest {
         assertThat(keys.getValue())
                 .contains("TvBox", "csp_TgChannel", "csp_AList", "csp_XiaoYa", "csp_TgDouBan")
                 .doesNotContain("csp_BiliBili", "csp_Emby");
+    }
+
+    // ── 按安全 Token(同步分区)筛选与展示名 ─────────────────────────────────
+
+    @Test
+    void listFiltersByExactSyncScope() {
+        History row = history("abc", "v1", 200);
+        PageRequest pageable = PageRequest.of(0, 100, Sort.by(Sort.Direction.DESC, "updatedAt", "id"));
+        when(historyRepository.findPageByUidAndSourceKindIsNotNullAndSyncScope(UID, "u-alice", pageable))
+                .thenReturn(new PageImpl<>(List.of(row), pageable, 1));
+
+        Page<PlaybackSyncInput> records = service.list(UID, 0, 100, false, "u-alice");
+
+        assertThat(records.getContent()).extracting(PlaybackSyncInput::getVodId).containsExactly("v1");
+        verify(historyRepository).findPageByUidAndSourceKindIsNotNullAndSyncScope(UID, "u-alice", pageable);
+    }
+
+    @Test
+    void listDashScopeSelectsUidLevelRecords() {
+        // "-" 占位沿用订阅 token 惯例:筛选 uid 级分区(全局互通,syncScope 为空)
+        PageRequest pageable = PageRequest.of(0, 100, Sort.by(Sort.Direction.DESC, "updatedAt", "id"));
+        when(historyRepository.findPageByUidAndSourceKindIsNotNullAndSyncScopeIsNull(UID, pageable))
+                .thenReturn(new PageImpl<>(List.of(), pageable, 0));
+
+        Page<PlaybackSyncInput> records = service.list(UID, 0, 100, false, "-");
+
+        assertThat(records.getTotalElements()).isZero();
+        verify(historyRepository).findPageByUidAndSourceKindIsNotNullAndSyncScopeIsNull(UID, pageable);
+        verify(historyRepository, never()).findPageByUidAndSourceKindIsNotNull(anyInt(), any());
+    }
+
+    @Test
+    void listWithoutScopeKeepsLegacyQueries() {
+        PageRequest pageable = PageRequest.of(0, 100, Sort.by(Sort.Direction.DESC, "updatedAt", "id"));
+        when(historyRepository.findPageByUidAndSourceKindIsNotNull(UID, pageable))
+                .thenReturn(new PageImpl<>(List.of(), pageable, 0));
+
+        service.list(UID, 0, 100, false, null);
+
+        verify(historyRepository).findPageByUidAndSourceKindIsNotNull(UID, pageable);
+    }
+
+    @Test
+    void listScopesReturnsDistinctScopesWithDisplayLabels() {
+        Subscription sub = new Subscription();
+        sub.setId(3);
+        sub.setName("客厅电视");
+        when(subscriptionRepository.findById(3)).thenReturn(java.util.Optional.of(sub));
+        when(subscriptionRepository.findById(99)).thenReturn(java.util.Optional.empty());
+        // 默认共享 token 恰为 8 字符(Utils.generateUsername):不得被全遮成 "****"
+        when(historyRepository.findDistinctSyncScope(UID))
+                .thenReturn(new ArrayList<>(Arrays.asList(
+                        "shared-tok123456", "ab12Cd34", "u-alice", "u-bob/99", "u-alice/3", null)));
+
+        List<PlaybackScopeDto> scopes = service.listScopes(UID);
+
+        // uid 级(null)排最前;其余按 scope 字典序
+        assertThat(scopes).extracting(PlaybackScopeDto::getScope)
+                .containsExactly(null, "ab12Cd34", "shared-tok123456", "u-alice", "u-alice/3", "u-bob/99");
+        assertThat(scopes).extracting(PlaybackScopeDto::getLabel)
+                .containsExactly(
+                        "全局互通",
+                        "ab12Cd34",
+                        "shar...3456",
+                        "用户 alice",
+                        "用户 alice · 订阅 客厅电视",
+                        "用户 bob · 订阅 #99");
+    }
+
+    @Test
+    void listTokensCarriesScopeAndLabel() {
+        PlaybackToken scoped = new PlaybackToken();
+        scoped.setId(11);
+        scoped.setUid(UID);
+        scoped.setToken("playback-token-value");
+        scoped.setName("系统订阅同步");
+        scoped.setSyncScope("u-alice");
+        PlaybackToken uidLevel = new PlaybackToken();
+        uidLevel.setId(12);
+        uidLevel.setUid(UID);
+        uidLevel.setToken("manual-token-value");
+        uidLevel.setName("客厅投影");
+        when(tokenRepository.findByUid(UID)).thenReturn(List.of(scoped, uidLevel));
+
+        List<PlaybackTokenDto> tokens = service.listTokens(UID);
+
+        assertThat(tokens).extracting(PlaybackTokenDto::getSyncScope)
+                .containsExactly("u-alice", null);
+        assertThat(tokens).extracting(PlaybackTokenDto::getSyncScopeLabel)
+                .containsExactly("用户 alice", null);
+        // 令牌本体仍按列表口径脱敏
+        assertThat(tokens).extracting(PlaybackTokenDto::getToken)
+                .containsExactly("play...alue", "manu...alue");
     }
 
     @Test
@@ -942,6 +1042,148 @@ class PlaybackSyncServiceTest {
                 .isNull();
         assertThat(saved.getScope()).isEqualTo("all");
         assertThat(saved.getDeletedAt()).isGreaterThan(100L);
+    }
+
+    // ── csp_Media 集数回归保护 ────────────────────────────────────────────────
+
+    @Test
+    void mediaEpisodeNumberParsing() {
+        // spider 详情形态与 webhtv 原生形态(带 @{线路}@{序号} 后缀)都能解出逻辑集号
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("msubep-51-1")).isEqualTo(1);
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("msubep-51-86")).isEqualTo(86);
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("msubep-67-15@0@14")).isEqualTo(15);
+        // 占位动作 id / 空值不是选集
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("msubstat-60")).isNull();
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("msubinspect-63")).isNull();
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("msubinfo-51")).isNull();
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf("")).isNull();
+        assertThat(PlaybackSyncService.mediaEpisodeNumberOf(null)).isNull();
+    }
+
+    private PlaybackSyncInput mediaInput(String episodeUrl, String clientKey) {
+        PlaybackSyncInput in = new PlaybackSyncInput();
+        in.setSourceKind("site");
+        in.setSourceKey("csp_Media");
+        in.setVodId("msub:51");
+        in.setEpisodeUrl(episodeUrl);
+        in.setClientKey(clientKey);
+        return in;
+    }
+
+    @Test
+    void jarChannelEpisodeRegressionIsRejected() {
+        // jar 通道(clientKey 为空)上报第 1 集,在库是原生通道推进到的第 86 集 → 回归,拒收
+        History exist = history("csp_Media", "msub:51", 1000);
+        exist.setEpisodeUrl("msubep-51-86@0@85");
+        assertThat(PlaybackSyncService.isMediaEpisodeRegression(
+                mediaInput("msubep-51-1", null), exist)).isTrue();
+    }
+
+    @Test
+    void nativeChannelRegressionIsAllowed() {
+        // 原生通道带 clientKey:用户当下真实操作(含主动重看),放行
+        History exist = history("csp_Media", "msub:51", 1000);
+        exist.setEpisodeUrl("msubep-51-86@0@85");
+        assertThat(PlaybackSyncService.isMediaEpisodeRegression(
+                mediaInput("msubep-51-1@0@0", "device-1"), exist)).isFalse();
+    }
+
+    @Test
+    void episodeProgressIsNotRegression() {
+        // 集数前进或持平都放行:spider 链路正常播新一集(无后缀)不被格式差异误伤
+        History exist = history("csp_Media", "msub:51", 1000);
+        exist.setEpisodeUrl("msubep-51-86@0@85");
+        assertThat(PlaybackSyncService.isMediaEpisodeRegression(
+                mediaInput("msubep-51-87", null), exist)).isFalse();
+        assertThat(PlaybackSyncService.isMediaEpisodeRegression(
+                mediaInput("msubep-51-86", null), exist)).isFalse();
+    }
+
+    @Test
+    void regressionGuardOnlyAppliesToMediaSource() {
+        History exist = history("csp_BiliBili", "bv1", 1000);
+        exist.setEpisodeUrl("P86");
+        PlaybackSyncInput in = mediaInput("P1", null);
+        in.setSourceKey("csp_BiliBili");
+        assertThat(PlaybackSyncService.isMediaEpisodeRegression(in, exist)).isFalse();
+    }
+
+    @Test
+    void staleMediaEpisodeFromJarDoesNotOverwriteNewerRecord() {
+        // 86 集(原生格式)在库;jar 通道的第 1 集残留行带着更新的时间戳上报 → 必须拒收。
+        // 这是"后端 86 集、各端显示第 1 集"的根源:LWW 只看时间戳,而残留行续播会不断
+        // 制造新时间戳。
+        History exist = history("csp_Media", "msub:51", 1000);
+        exist.setEpisodeUrl("msubep-51-86@0@85");
+        exist.setEpisode(85);
+        when(historyRepository.findAllByUidAndSourceKindAndSourceKeyAndVodId(UID, "site", "csp_Media", "msub:51"))
+                .thenReturn(List.of(exist));
+
+        service.apply(id(UID), Map.of(
+                "sourceKind", "site",
+                "sourceKey", "csp_Media",
+                "vodId", "msub:51",
+                "vodName", "吞噬星空",
+                "episodeUrl", "msubep-51-1",
+                "episode", 0,
+                "updatedAt", 5000), null, null);
+
+        verify(historyRepository, never()).save(any());
+    }
+
+    @Test
+    void nativeRewatchStillOverwritesRecord() {
+        // 原生通道主动重看第 1 集:用户真实意图,必须照常同步
+        History exist = history("csp_Media", "msub:51", 1000);
+        exist.setEpisodeUrl("msubep-51-86@0@85");
+        exist.setEpisode(85);
+        when(historyRepository.findAllByUidAndSourceKindAndSourceKeyAndVodId(UID, "site", "csp_Media", "msub:51"))
+                .thenReturn(List.of(exist));
+
+        service.apply(id(UID), Map.of(
+                "sourceKind", "site",
+                "sourceKey", "csp_Media",
+                "vodId", "msub:51",
+                "episodeUrl", "msubep-51-1@0@0",
+                "episode", 0,
+                "clientKey", "device-1",
+                "updatedAt", 5000), null, null);
+
+        assertThat(savedHistory().getEpisodeUrl()).isEqualTo("msubep-51-1@0@0");
+    }
+
+    @Test
+    void freshSpiderPlayStillWinsLww() {
+        // spider 链路(无后缀)播新一集是正常进度:必须照常覆盖旧的低集数记录
+        History exist = history("csp_Media", "msub:51", 1000);
+        exist.setEpisodeUrl("msubep-51-1@0@0");
+        exist.setEpisode(0);
+        when(historyRepository.findAllByUidAndSourceKindAndSourceKeyAndVodId(UID, "site", "csp_Media", "msub:51"))
+                .thenReturn(List.of(exist));
+
+        service.apply(id(UID), Map.of(
+                "sourceKind", "site",
+                "sourceKey", "csp_Media",
+                "vodId", "msub:51",
+                "episodeUrl", "msubep-51-86",
+                "episode", 85,
+                "updatedAt", 5000), null, null);
+
+        assertThat(savedHistory().getEpisodeUrl()).isEqualTo("msubep-51-86");
+        assertThat(savedHistory().getEpisode()).isEqualTo(85);
+    }
+
+    @Test
+    void mediaPlaceholderActionIdsAreDropped() {
+        // 占位动作 id(msubstat-/msubinfo-/msubinspect-)不是真实播放,不得落成播放记录
+        service.apply(id(UID), Map.of(
+                "sourceKind", "site",
+                "sourceKey", "csp_Media",
+                "vodId", "msub:60",
+                "episodeUrl", "msubstat-60",
+                "updatedAt", 5000), null, null);
+
+        verify(historyRepository, never()).save(any());
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────

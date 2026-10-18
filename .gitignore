@@ -67,3 +67,5 @@ musl-toolchain/
 /.claude/worktrees/
 default.conf
 /docs/security/
+telemetry.properties
+/src/test/python/

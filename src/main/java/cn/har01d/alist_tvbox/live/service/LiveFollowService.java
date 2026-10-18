@@ -213,8 +213,19 @@ public class LiveFollowService {
 
     /** 关注列表(TVBox "关注"分类用):并行刷新开播状态,开播在前,其余按关注时间倒序。 */
     public MovieList list(int uid) {
+        return list(uid, null);
+    }
+
+    /**
+     * 关注列表按平台筛选(TVBox "关注"分类 filters 的服务端):只刷新/返回该平台的房间。
+     * platform 非已知平台 type 时(空/网页端透传的 platform=web 等)视为不过滤,返回全部。
+     */
+    public MovieList list(int uid, String platform) {
         lastConsumedAt = System.currentTimeMillis();
         List<LiveFollow> follows = followRepository.findByUidOrderByCreatedTimeDesc(uid);
+        if (StringUtils.isNotBlank(platform) && findPlatform(platform) != null) {
+            follows = follows.stream().filter(follow -> platform.equals(follow.getPlatform())).toList();
+        }
         MovieList result = new MovieList();
         if (follows.isEmpty()) {
             return result;
@@ -485,9 +496,15 @@ public class LiveFollowService {
         return info != null && StringUtils.isNotBlank(info.getVod_play_url());
     }
 
+    /** 已下线平台(服务已移除)的展示名:历史关注行仍可读,pure_live 3.1.6 同款「已下线」口径。 */
+    private static final Map<String, String> RETIRED_PLATFORMS = Map.of("huajiao", "花椒(已下线)");
+
     private String platformName(String type) {
         LivePlatform platform = findPlatform(type);
-        return platform == null ? type : platform.getName();
+        if (platform != null) {
+            return platform.getName();
+        }
+        return RETIRED_PLATFORMS.getOrDefault(type, type);
     }
 
     private LivePlatform findPlatform(String type) {
@@ -560,7 +577,7 @@ public class LiveFollowService {
         }
         String query = stored.contains("?") ? stored.substring(stored.indexOf('?') + 1) : "";
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath("/images")
                 .replaceQuery(query)
                 .build()

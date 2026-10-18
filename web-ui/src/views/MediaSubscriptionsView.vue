@@ -5,6 +5,7 @@
       <div class="page-actions">
         <el-button @click="loadAll">刷新</el-button>
         <el-button @click="openNotify">设置</el-button>
+        <el-button v-if="store.admin" @click="openWanouDomains">域名状态</el-button>
         <el-button @click="exportSubs">导出</el-button>
         <el-button @click="importVisible = true">导入</el-button>
         <el-button @click="openNavigation">片单追更</el-button>
@@ -46,6 +47,8 @@
     </div>
 
     <div class="page-card">
+      <el-tabs v-model="mainTab">
+        <el-tab-pane label="我的追剧" name="subs">
       <div class="batch-bar" v-if="subscriptions.length">
         <el-select v-model="statusFilter" size="small" style="width: 110px" placeholder="全部状态">
           <el-option label="全部状态" value=""/>
@@ -139,6 +142,11 @@
           </el-table-column>
         </el-table>
       </div>
+        </el-tab-pane>
+        <el-tab-pane label="稍后再看" name="want" lazy>
+          <WatchlistView ref="watchlistRef" embedded @subscribed="loadAll"/>
+        </el-tab-pane>
+      </el-tabs>
     </div>
 
     <el-dialog v-model="formVisible" :title="form.id ? '编辑订阅' : '新建订阅'" width="750" top="3vh">
@@ -184,6 +192,10 @@
                 <div>{{ item.name }}({{ item.year }}){{ item.score ? ' ★' + item.score : '' }}</div>
                 <div class="sub-text">{{ providerName(item.provider) }} · {{ item.id }}</div>
               </div>
+              <el-button size="small" style="margin-left: auto" @click.stop="wantMeta(item)"
+                         :disabled="wantedKeys.has(item.provider + item.id)">
+                {{ wantedKeys.has(item.provider + item.id) ? '已想看' : '想看' }}
+              </el-button>
             </div>
           </div>
           <div v-if="form.metaId" class="sub-text">已选:{{ providerName(form.metaProvider) }} {{ form.metaId }}</div>
@@ -230,6 +242,10 @@
             当前离线下载: {{ offlineAccountLabel }}
           </span>
         </el-form-item>
+        <el-form-item v-if="form.mode !== 'TRANSFER'" label="115自有分享">
+          <el-switch v-model="form.selfShare"/>
+          <span class="sub-text" style="margin-left:8px">可看集转存到自有115盘建永久分享快照后删源释放空间,上游失效不影响已追集数;需 cookie 版115账号,单批转存瞬时占盘(空间大再开);超过{{ globalSelfShareLimit === 0 ? '不限(0)' : globalSelfShareLimit + '集' }}的长番自动跳过;与转存模式互斥</span>
+        </el-form-item>
         <el-form-item label="巡检周期(时)">
           <el-input-number v-model="form.checkIntervalHours" :min="1" :max="168"/>
           <span class="sub-text" style="margin-left:8px">绑定元数据后按播出日程自动调度</span>
@@ -238,6 +254,13 @@
           <el-time-select v-model="form.customAirClock" start="00:00" end="23:45" step="00:15"
                           placeholder="自动(官方日程/平台桥接,默认 20:00)" clearable style="width: 160px"/>
           <span class="sub-text" style="margin-left:8px">官方只给日期没给时刻的剧按 20:00 兜底;确认实际排播后手动校正,清空恢复自动</span>
+        </el-form-item>
+        <el-form-item label="更新日">
+          <el-select v-model="form.airWeekdays" multiple placeholder="不限制(按官方日程/巡检周期)">
+            <el-option v-for="(label, idx) in ['周一', '周二', '周三', '周四', '周五', '周六', '周日']"
+                       :key="idx" :label="label" :value="idx + 1"/>
+          </el-select>
+          <span class="sub-text" style="margin-left:8px">固定周几更新(欧美剧/追番):巡检只落在这些天的播出时刻,官方日程缺失/不准时用;清空恢复自动</span>
         </el-form-item>
         <el-form-item label="主网盘(覆盖)">
           <el-select v-model="form.mainDrives" multiple clearable :placeholder="`跟随全局${globalMainDrivesLabel}`">
@@ -306,7 +329,7 @@
       <div class="resources-toolbar">
         <el-button size="small" type="primary" plain @click="openAddResource">添加资源</el-button>
         <el-button size="small" type="primary" plain @click="openManualMagnet">磁力补缺</el-button>
-        <span class="sub-text">粘贴分享链接只入候选池,不挂载不动主源;巡检/补缺时自动探测,想立即挂载点「启用」(只挂为补缺源,不动主源;换主源用「转主源」)</span>
+        <span class="sub-text">分享链接只入候选池,巡检/补缺时自动探测,想立即挂载点「启用」(只挂为补缺源,不动主源;换主源用「转主源」);网盘里已有的剧用「网盘目录」选择器选中目录即入账为路径资源</span>
       </div>
       <el-table :data="resources" border v-loading="resourcesLoading">
         <el-table-column prop="title" label="资源" min-width="240" show-overflow-tooltip>
@@ -321,9 +344,14 @@
         </el-table-column>
         <el-table-column prop="driveName" label="盘" width="90"/>
         <el-table-column prop="score" label="评分" width="70" sortable/>
-        <el-table-column label="状态" width="90">
+        <el-table-column label="状态" width="110">
           <template #default="scope">
-            <el-tag size="small" :type="stateType(scope.row.state)">{{ stateLabel(scope.row.state) }}</el-tag>
+            <!-- 退役/拒绝行悬停可见退役原因与检测时间,用户据此判断是否误判走「恢复」 -->
+            <el-tooltip
+                :disabled="!['RETIRED', 'REJECTED'].includes(scope.row.state)"
+                :content="retireReasonText(scope.row)" placement="top">
+              <el-tag size="small" :type="stateType(scope.row.state)">{{ stateLabel(scope.row.state) }}</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column prop="episodesFound" label="集数" width="70"/>
@@ -333,6 +361,7 @@
         <el-table-column label="角色" width="90">
           <template #default="scope">
             <el-tag v-if="scope.row.primary" size="small" type="success">主源</el-tag>
+            <el-tag v-else-if="isPathRow(scope.row)" size="small" type="warning">路径</el-tag>
             <el-tag v-else-if="scope.row.state === 'MOUNTED'" size="small" type="warning">补缺</el-tag>
             <el-tag v-if="scope.row.pinned" size="small" type="danger" style="margin-left: 4px">钉选</el-tag>
             <el-tag v-if="scope.row.startEpisode" size="small" type="info" style="margin-left: 4px">起{{ scope.row.startEpisode }}</el-tag>
@@ -342,8 +371,8 @@
           <template #default="scope">
             <el-button v-if="scope.row.state === 'CANDIDATE'" link type="primary" size="small"
                        @click="enableResource(scope.row)">启用</el-button>
-            <!-- 转主源一步直达:候选行也要有(线上反馈"不缺的候补无法变主源"——此前只有已挂载补缺行才有此按钮,候选换主源得先启用再转两步,或用语义不直白的钉选) -->
-            <el-button v-if="scope.row.state === 'CANDIDATE' || (scope.row.state === 'MOUNTED' && !scope.row.primary)"
+            <!-- 转主源一步直达:候选行也要有(线上反馈"不缺的候补无法变主源"——此前只有已挂载补缺行才有此按钮,候选换主源得先启用再转两步,或用语义不直白的钉选);路径资源直连用户网盘目录,无分享链接可挂到固定路径,不参与转正 -->
+            <el-button v-if="!isPathRow(scope.row) && (scope.row.state === 'CANDIDATE' || (scope.row.state === 'MOUNTED' && !scope.row.primary))"
                        link type="primary" size="small"
                        @click="activateResource(scope.row)">转主源</el-button>
             <el-button v-if="scope.row.pinned" link type="danger" size="small"
@@ -352,31 +381,53 @@
                        @click="pinResource(scope.row)">钉选</el-button>
             <el-button v-if="scope.row.state !== 'REMOVED'" link type="warning" size="small"
                        @click="setResourceStart(scope.row)">起始集号</el-button>
-            <el-button v-if="scope.row.state === 'REMOVED'" link type="primary" size="small"
+            <!-- 恢复覆盖三种离池形态:手动移除墓碑 + 判死退役/盘检拒绝(检测错误时不等冷却期满,手动复活立即回候选池重探) -->
+            <el-button v-if="['REMOVED', 'RETIRED', 'REJECTED'].includes(scope.row.state)" link type="primary" size="small"
                        @click="restoreResource(scope.row)">恢复</el-button>
-            <el-button v-else-if="!scope.row.primary" link type="danger" size="small"
+            <el-button v-if="!['REMOVED', 'RETIRED', 'REJECTED'].includes(scope.row.state) && !scope.row.primary"
+                       link type="danger" size="small"
                        @click="removeResource(scope.row)">移除</el-button>
           </template>
         </el-table-column>
       </el-table>
     </el-drawer>
 
-    <el-dialog v-model="addResourceVisible" title="手动添加候选资源" width="560">
-      <el-form label-width="70px" @submit.prevent>
-        <el-form-item label="分享链接">
-          <el-input v-model="addResourceForm.link" type="textarea" :rows="3" placeholder="网盘分享链接(夸克/UC/阿里/百度/115/天翼/移动/123/迅雷/光鸭)"
-                    :disabled="addResourceSaving"/>
-        </el-form-item>
-        <el-form-item label="提取码">
-          <el-input v-model="addResourceForm.password" placeholder="无提取码可留空" :disabled="addResourceSaving"/>
-        </el-form-item>
-      </el-form>
-      <div class="sub-text">
-        只加入候选池:不挂载、不替换当前主源。巡检补缺/换源时自动探测(候选序置顶);要立即挂载,请在列表点「启用」(只挂为补缺源,不动主源;换主源用「转主源/钉选」)。
-      </div>
+    <el-dialog v-model="addResourceVisible" title="手动添加候选资源" width="620" top="6vh">
+      <el-tabs v-model="addResourceTab">
+        <el-tab-pane label="网盘目录" name="dir">
+          <div class="sub-text">
+            浏览已挂载网盘,选中剧集目录即时入账为「路径资源」:直接供流不动主源,网盘里目录更新后巡检自动同步 —— 网盘里已有的剧,选进来就能看。
+          </div>
+          <el-tree :key="dirTreeKey" lazy node-key="path" highlight-current
+                   :props="{label: 'name', isLeaf: () => false}"
+                   :load="loadDriveDirs" :expand-on-click-node="true"
+                   empty-text="没有子目录(或未挂载任何网盘)"
+                   v-loading="dirTreeLoading"
+                   @node-click="onDirNodeClick"
+                   style="max-height: 46vh; overflow: auto; border: 1px solid var(--el-border-color-lighter); border-radius: 4px; padding: 4px"/>
+          <div v-if="selectedDirPath" class="sub-text" style="margin-top: 6px">已选目录:{{ selectedDirPath }}</div>
+        </el-tab-pane>
+        <el-tab-pane label="分享链接" name="link">
+          <el-form label-width="70px" @submit.prevent>
+            <el-form-item label="分享链接">
+              <el-input v-model="addResourceForm.link" type="textarea" :rows="3"
+                        placeholder="网盘分享链接(夸克/UC/阿里/百度/115/天翼/移动/123/迅雷/光鸭),或以 / 开头的网盘目录路径"
+                        :disabled="addResourceSaving"/>
+            </el-form-item>
+            <el-form-item label="提取码">
+              <el-input v-model="addResourceForm.password" placeholder="分享链接的提取码,可留空" :disabled="addResourceSaving"/>
+            </el-form-item>
+          </el-form>
+          <div class="sub-text">
+            分享链接只加入候选池:不挂载、不替换当前主源,巡检补缺/换源时自动探测(候选序置顶);要立即挂载,请在列表点「启用」(只挂为补缺源,不动主源;换主源用「转主源/钉选」)。
+          </div>
+        </el-tab-pane>
+      </el-tabs>
       <template #footer>
         <el-button @click="addResourceVisible = false">取消</el-button>
-        <el-button type="primary" :loading="addResourceSaving" @click="submitAddResource">添加</el-button>
+        <el-button v-if="addResourceTab === 'dir'" type="primary" :disabled="!selectedDirPath"
+                   :loading="addResourceSaving" @click="submitAddDirResource">添加此目录</el-button>
+        <el-button v-else type="primary" :loading="addResourceSaving" @click="submitAddResource">添加</el-button>
       </template>
     </el-dialog>
 
@@ -483,6 +534,7 @@
           </el-button>
           <el-button size="small" @click="checkFromDetail">检查更新</el-button>
           <el-button size="small" type="primary" plain @click="openManualMagnet">磁力补缺</el-button>
+          <el-button v-if="current?.selfShare" size="small" plain @click="selfShareNow(current)">固化分享</el-button>
           <el-button v-if="current?.status === 'ENDED' && hasNextSeason" size="small" type="warning" plain
                      @click="current && subscribeNextSeason(current)">下一季</el-button>
           <el-button v-if="detailData?.subscription?.mountPath" size="small" link type="primary"
@@ -617,6 +669,72 @@
       </div>
     </el-drawer>
 
+    <el-drawer v-model="wanouDomainVisible" title="玩偶站点域名状态" size="46%">
+      <div v-loading="wanouStatusLoading" style="min-height: 120px">
+        <div style="margin-bottom: 12px">
+          <el-button type="primary" size="small" :loading="wanouProbing" @click="probeWanouDomains">立即探测</el-button>
+          <span class="sub-text" style="margin-left:8px">每小时自动探测;站点按最低延迟排序,域名列表按采用优先级排序,首条即当前采用(延迟最低的可达域名)</span>
+        </div>
+        <el-table v-if="wanouSites.length" :data="sortedWanouSites" row-key="siteId">
+          <el-table-column type="expand">
+            <template #default="scope">
+              <el-table :data="scope.row.domains" size="small" style="margin: 0 0 8px 24px">
+                <el-table-column label="域名" min-width="240" show-overflow-tooltip>
+                  <template #default="d">
+                    <el-link type="primary" :href="d.row.url" target="_blank" rel="noopener">{{ d.row.url }}</el-link>
+                  </template>
+                </el-table-column>
+                <el-table-column label="状态" width="90">
+                  <template #default="d">
+                    <el-tag v-if="d.row.ok" size="small" type="success">可达</el-tag>
+                    <el-tag v-else size="small" type="danger">不可达</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="延迟" width="110">
+                  <template #default="d">
+                    <span v-if="d.row.ok">{{ d.row.latencyMs }} ms</span>
+                    <span v-else class="sub-text">—</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="原因" min-width="130" show-overflow-tooltip>
+                  <template #default="d">
+                    <span class="sub-text">{{ d.row.error || '—' }}</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </template>
+          </el-table-column>
+          <el-table-column label="站点" width="90">
+            <template #default="scope">{{ scope.row.siteName }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="scope">
+              <el-tag v-if="scope.row.ok" size="small" type="success">可用</el-tag>
+              <el-tag v-else size="small" type="danger">失效</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="最低延迟" width="90">
+            <template #default="scope">
+              <span v-if="wanouMinLatency(scope.row) !== null">{{ wanouMinLatency(scope.row) }} ms</span>
+              <span v-else class="sub-text">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="当前采用域名" min-width="240" show-overflow-tooltip>
+            <template #default="scope">
+              <el-link v-if="scope.row.bestUrl" type="primary" :href="scope.row.bestUrl" target="_blank" rel="noopener">{{ scope.row.bestUrl }}</el-link>
+              <span v-else class="sub-text">—(全域名不可达,等待下轮探测)</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="可达/总数" width="95">
+            <template #default="scope">
+              {{ scope.row.domains.filter((d: WanouDomainStatusDto) => d.ok).length }}/{{ scope.row.domains.length }}
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-else description="尚未探测,点击「立即探测」开始"/>
+      </div>
+    </el-drawer>
+
     <el-dialog v-model="importVisible" title="导入订阅" width="600">
       <el-input v-model="importText" type="textarea" :rows="12" placeholder='粘贴导出的 JSON 数组'/>
       <template #footer>
@@ -641,12 +759,24 @@
               </el-select>
               <span class="sub-text">主网盘以外允许进候选池的网盘;不配置则候选/补缺/分盘线路只有主网盘的源(主网盘也未配置时才不限盘)</span>
             </el-form-item>
+            <el-form-item v-if="store.admin" label="115自有分享">
+              <el-switch v-model="notifyForm.selfShareEnabled"/>
+              <span class="sub-text">总闸(默认关):开启后订阅级打了开关的追剧把可看集转存到自有 115 盘建永久分享快照后删源释放空间;需 cookie 版 115 账号,单批转存瞬时占盘,空间大的用户才适合</span>
+            </el-form-item>
+            <el-form-item v-if="store.admin" label="自有分享集数上限">
+              <el-input-number v-model="notifyForm.selfShareMaxEpisodes" :min="0" :max="5000"/>
+              <span class="sub-text">集数规模(官方总集数与可看集数取大)超过上限的剧不启用自有分享——长番分享数会随更新无限增长且首批占盘过大;已有批次照常供播;0 = 不限</span>
+            </el-form-item>
             <el-form-item label="Bot Token">
               <el-input v-model="notifyForm.botToken" placeholder="123456:ABC-...,留空关闭通知"/>
             </el-form-item>
             <el-form-item label="Chat ID">
               <el-input v-model="notifyForm.chatId" placeholder="与 bot 对话后获取"/>
               <span v-if="!store.admin" class="sub-text">个人 TG 通知渠道:留空时沿用管理员配置的全局渠道</span>
+            </el-form-item>
+            <el-form-item v-if="store.admin" label="TG 代理">
+              <el-input v-model="notifyForm.botProxy" placeholder="http://192.168.1.2:7890 或 socks5://...,留空直连"/>
+              <span class="sub-text">服务器访问 Telegram API(机器人收发+追剧通知)走的代理,只作用于机器人不影响网盘请求;保存后下一轮拉取即生效,无需重启。容器环境变量 HTTP_PROXY 对 Java 后端无效</span>
             </el-form-item>
             <el-form-item label="免打扰时段">
               <el-input v-model="notifyForm.quietHours" placeholder="23:00-08:00,留空立即发送"/>
@@ -655,6 +785,10 @@
             <el-form-item v-if="store.admin" label="Bot 交互">
               <el-switch v-model="notifyForm.botEnabled"/>
               <span class="sub-text" style="margin-left:8px">允许在 Telegram 里与 Bot 对话(查订阅/搜索/追剧/退订);只需收通知不需要对话时可关闭</span>
+            </el-form-item>
+            <el-form-item v-if="store.admin" label="采集源兜底">
+              <el-switch v-model="notifyForm.collectionFallback"/>
+              <span class="sub-text" style="margin-left:8px">候选源均不可用时,播放前从采集站搜索并补齐缺失剧集(当前集+后3集,直链不改写追剧数据)</span>
             </el-form-item>
             <el-form-item v-if="store.admin" label="完结归档(天)">
               <el-input-number v-model="notifyForm.archiveDays" :min="0" :max="3650"/>
@@ -683,7 +817,7 @@
               </el-select>
               <span class="sub-text">对应网盘的候选资源打分 +15(已配置账号本身 +8),如夸克 SVIP/百度 SVIP/115 会员</span>
             </el-form-item>
-            <span v-if="store.admin" class="sub-text">玩偶聚合搜索源默认开启无需配置(wanou-enabled 可关);盘聚是项目内命名,实际站点为 SeedHub 系聚合站,免登录无需配置;盘链/观影/蜗牛在各自标签页配置,无凭证的源自动关闭</span>
+            <span v-if="store.admin" class="sub-text">玩偶聚合搜索源默认开启无需配置(wanou-enabled 可关;域名状态入口在主页「域名状态」按钮,每小时自动探测并采用延迟最低的可达域名);盘聚是项目内命名,实际站点为 SeedHub 系聚合站,免登录无需配置;盘链/观影/蜗牛/聚影在各自标签页配置,无凭证的源自动关闭</span>
           </el-tab-pane>
           <el-tab-pane label="资源筛选" name="poolFilter">
             <el-form-item label="清晰度门槛">
@@ -723,28 +857,90 @@
                 <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">到官网获取 →</a>
               </span>
             </el-form-item>
-            <el-form-item label="TMDB 线路">
+            <el-form-item label="TMDB 代理">
               <el-select v-model="notifyForm.tmdbApiHost" style="width: 100%"
                         filterable allow-create default-first-option
                         placeholder="选择预设,或输入自定义 CF Worker 反代地址">
                 <el-option v-for="opt in tmdbApiHostOptions" :key="opt.value" :label="opt.label" :value="opt.value"/>
               </el-select>
-              <span class="sub-text">国内直连官方不通时切换反代;Worker 轮询池分摊各 worker 每日限额,Worker 型 API 与封面同域,NAStool 型自动分开配置图床(系统设置页同一配置);可直接输入自建 CF Worker 反代地址(https://... 开头),多个地址逗号分隔自动轮询</span>
+              <span class="sub-text">可以手动输入代理地址，立即生效;多个地址逗号分隔自动轮询;
+                <a href="/tmdb_proxy_worker.js" target="_blank" rel="noopener">自建 Worker 参考代码 →</a>
+              </span>
             </el-form-item>
           </el-tab-pane>
           <el-tab-pane v-if="store.admin" label="盘链" name="panlian">
         <el-form-item label="站点">
           <el-input v-model="notifyForm.panlianHost" placeholder="留空用内置地址;自定义镜像站填 https://..."/>
         </el-form-item>
+        <el-form-item label="账号池">
+          <div style="width:100%">
+            <div v-for="(account, index) in panlianAccountRows" :key="index"
+                 style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+              <el-select v-model="account.type" style="width:100px">
+                <el-option label="账号密码" value="account"/>
+                <el-option label="Cookie" value="cookie"/>
+              </el-select>
+              <el-input v-if="account.type === 'cookie'" v-model="account.cookie"
+                        placeholder="浏览器登录后复制的 Cookie" style="flex:1"/>
+              <template v-else>
+                <el-input v-model="account.username" placeholder="账号(邮箱或用户名)" style="flex:1"/>
+                <el-input v-model="account.password" type="password" show-password placeholder="密码" style="flex:1"/>
+                <el-button link type="primary" @click="openPanlianCaptchaLogin(account.username, account.password)">验证码登录</el-button>
+              </template>
+              <el-button link type="danger" @click="panlianAccountRows.splice(index, 1)">删除</el-button>
+            </div>
+            <div style="margin-top:4px">
+              <el-button size="small" @click="panlianAccountRows.push({type: 'account', username: '', password: '', cookie: ''})">+ 添加账号</el-button>
+              <el-button size="small" type="primary" :loading="panlianPoolSaving" :disabled="!notifyLoaded" @click="savePanlianPool">保存账号池</el-button>
+            </div>
+            <span class="sub-text">每个账号独立一行(类型可切换账号密码/Cookie),保存为 JSON;多账号配额叠加(每日签到 +20/号)轮换搜索,单号解锁配额用尽自动切下一号续链;同一账号配了用户名/邮箱/Cookie 多种形态会自动去重(保留优先级:用户名 &gt; 邮箱 &gt; Cookie);全部留空该搜索源自动关闭</span>
+          </div>
+        </el-form-item>
         <el-form-item label="账号">
-          <el-input v-model="notifyForm.panlianUsername" placeholder="注册邮箱;账号密码或 Cookie 至少配一样"/>
+          <el-input v-model="notifyForm.panlianUsername" placeholder="单账号填这里;多个账号用上方账号池"/>
         </el-form-item>
         <el-form-item label="密码">
           <el-input v-model="notifyForm.panlianPassword" type="password" show-password placeholder="与账号配套"/>
         </el-form-item>
         <el-form-item label="Cookie">
           <el-input v-model="notifyForm.panlianCookie" type="textarea" :rows="2"
-                    placeholder="可代替账号密码:浏览器登录后复制 Cookie;无凭证时该搜索源自动关闭"/>
+                    placeholder="可代替账号密码:浏览器登录后复制 Cookie;作为池内一个成员参与轮换"/>
+        </el-form-item>
+        <el-form-item label="账号状态">
+          <div style="width:100%">
+            <div>
+              <el-button size="small" :loading="panlianStatusLoading" @click="loadPanlianAccounts">刷新账号状态</el-button>
+              <el-button size="small" @click="openPanlianCaptchaLogin()">验证码登录</el-button>
+            </div>
+          <el-table v-if="panlianAccounts.length" :data="panlianAccounts" size="small" border style="margin-top:8px">
+            <el-table-column prop="identity" label="账号" min-width="150"/>
+            <el-table-column prop="username" label="昵称" min-width="90"/>
+            <el-table-column label="邮箱" min-width="170">
+              <template #default="{row}">
+                <span>{{ row.email || '—' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="签到" width="90" align="center">
+              <template #default="{row}">
+                <el-tag v-if="row.checkinDone" type="success" size="small">已签 +{{ row.checkinBonus }}</el-tag>
+                <el-tag v-else type="warning" size="small">未签</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="解锁配额" width="150" align="center">
+              <template #default="{row}">
+                <span>{{ row.quotaRemaining }}/{{ row.quotaLimit }}<span v-if="row.quotaUsed"> · 已用 {{ row.quotaUsed }}</span></span>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="130">
+              <template #default="{row}">
+                <el-tag v-if="row.status === 'ok' && !row.exhaustedToday" type="success" size="small">正常</el-tag>
+                <el-tag v-else-if="row.status === 'ok'" type="info" size="small">今日配额尽</el-tag>
+                <el-tag v-else type="danger" size="small">{{ row.message || row.status }}</el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+          <span class="sub-text">实时查询站点(逐号登录拉任务与资料,只读不触发签到);签到由搜索时自动完成,配额每日重置;账号密码形态登录失败提示「需图形验证码」时,点「验证码登录」人工输码完成登录(会话 30 天免重登)</span>
+          </div>
         </el-form-item>
           </el-tab-pane>
           <el-tab-pane v-if="store.admin" label="观影" name="guanying">
@@ -757,10 +953,20 @@
         <el-form-item label="密码">
           <el-input v-model="notifyForm.guanyingPassword" type="password" show-password placeholder="与账号配套"/>
         </el-form-item>
-        <el-form-item label="Cookie">
-          <el-input v-model="notifyForm.guanyingCookie" type="textarea" :rows="2"
-                    placeholder="可代替账号密码:浏览器登录后复制 Cookie;无凭证时该搜索源自动关闭"/>
-        </el-form-item>
+            <el-form-item label="Cookie">
+              <el-input v-model="notifyForm.guanyingCookie" type="textarea" :rows="2"
+                        placeholder="可代替账号密码:浏览器登录后复制 Cookie;无凭证时该搜索源自动关闭"/>
+            </el-form-item>
+            <el-form-item label="有效性">
+              <div style="width:100%">
+                <el-button size="small" :loading="siteCheckLoading.guanying" :disabled="!notifyLoaded"
+                           @click="checkSiteCookie('guanying')">检查登录态</el-button>
+                <el-tag v-if="siteCheckResult.guanying"
+                        :type="siteCheckResult.guanying!.valid ? 'success' : 'danger'"
+                        style="margin-left:8px">{{ siteCheckResult.guanying!.message }}</el-tag>
+                <span class="sub-text">Cookie 优先(自动过浏览器安全验证,镜像逐个尝试);Cookie 未填时用账号密码实测登录,成功自动保存会话;不触发签到</span>
+              </div>
+            </el-form-item>
           </el-tab-pane>
           <el-tab-pane v-if="store.admin" label="蜗牛" name="woniu">
         <el-form-item label="站点">
@@ -772,10 +978,20 @@
         <el-form-item label="密码">
           <el-input v-model="notifyForm.woniuPassword" type="password" show-password placeholder="与账号配套"/>
         </el-form-item>
-        <el-form-item label="Cookie">
-          <el-input v-model="notifyForm.woniuCookie" type="textarea" :rows="2"
-                    placeholder="须含 user_check(登录后复制);未登录网盘链接会被打码,无凭证时该搜索源自动关闭"/>
-        </el-form-item>
+            <el-form-item label="Cookie">
+              <el-input v-model="notifyForm.woniuCookie" type="textarea" :rows="2"
+                        placeholder="须含 user_check(登录后复制);未登录网盘链接会被打码,无凭证时该搜索源自动关闭"/>
+            </el-form-item>
+            <el-form-item label="有效性">
+              <div style="width:100%">
+                <el-button size="small" :loading="siteCheckLoading.woniu" :disabled="!notifyLoaded"
+                           @click="checkSiteCookie('woniu')">检查登录态</el-button>
+                <el-tag v-if="siteCheckResult.woniu"
+                        :type="siteCheckResult.woniu!.valid ? 'success' : 'danger'"
+                        style="margin-left:8px">{{ siteCheckResult.woniu!.message }}</el-tag>
+                <span class="sub-text">Cookie 优先;Cookie 未填时用账号密码实测登录,成功自动保存会话;Cookie 形态只读探测不触发签到</span>
+              </div>
+            </el-form-item>
           </el-tab-pane>
           <el-tab-pane v-if="store.admin" label="123臻藏" name="zencang">
             <el-form-item label="站点">
@@ -784,6 +1000,16 @@
             <el-form-item label="Cookie">
               <el-input v-model="notifyForm.zencangCookie" type="textarea" :rows="2"
                         placeholder="浏览器登录 123 云盘·臻藏阁后复制 Cookie(须含 wordpress_logged_in_xxx);正文默认隐藏,无 Cookie 时该搜索源自动关闭"/>
+            </el-form-item>
+            <el-form-item label="有效性">
+              <div style="width:100%">
+                <el-button size="small" :loading="siteCheckLoading.zencang" :disabled="!notifyLoaded"
+                           @click="checkSiteCookie('zencang')">检查 Cookie</el-button>
+                <el-tag v-if="siteCheckResult.zencang"
+                        :type="siteCheckResult.zencang!.valid ? 'success' : 'danger'"
+                        style="margin-left:8px">{{ siteCheckResult.zencang!.message }}</el-tag>
+                <span class="sub-text">只读探测登录态,不触发评论;校验当前表单值,未保存也可先验</span>
+              </div>
             </el-form-item>
             <span class="sub-text">123 云盘主题资源站;仅订阅的候选盘(主网盘/扩展网盘)包含 123 网盘时才参与搜索</span>
           </el-tab-pane>
@@ -795,6 +1021,16 @@
               <el-input v-model="notifyForm.pan123communityCookie" type="textarea" :rows="2"
                         placeholder="可选;须含 bbs_sid 和 bbs_token(浏览器登录 123分享社区后复制)。不配也可匿名搜索,只是「回复后可见」帖自动跳过"/>
             </el-form-item>
+            <el-form-item label="有效性">
+              <div style="width:100%">
+                <el-button size="small" :loading="siteCheckLoading.pan123community" :disabled="!notifyLoaded"
+                           @click="checkSiteCookie('pan123community')">检查 Cookie</el-button>
+                <el-tag v-if="siteCheckResult.pan123community"
+                        :type="siteCheckResult.pan123community!.valid ? 'success' : 'danger'"
+                        style="margin-left:8px">{{ siteCheckResult.pan123community!.message }}</el-tag>
+                <span class="sub-text">只读探测登录态,不触发签到/回复;校验当前表单值,未保存也可先验</span>
+              </div>
+            </el-form-item>
             <span class="sub-text">123 云盘分享社区(纯 123 盘产出);仅订阅的候选盘(主网盘/扩展网盘)包含 123 网盘时才参与搜索</span>
           </el-tab-pane>
           <el-tab-pane v-if="store.admin" label="夸父" name="kuafu">
@@ -805,7 +1041,43 @@
               <el-input v-model="notifyForm.kuafuCookie" type="textarea" :rows="2"
                         placeholder="可选;须含 bbs_sid 和 bbs_token(浏览器登录夸父资源社后复制)。不配也能取到公开链接与锁贴泄漏链接,只是「回复后可见」帖自动跳过"/>
             </el-form-item>
+            <el-form-item label="有效性">
+              <div style="width:100%">
+                <el-button size="small" :loading="siteCheckLoading.kuafu" :disabled="!notifyLoaded"
+                           @click="checkSiteCookie('kuafu')">检查 Cookie</el-button>
+                <el-tag v-if="siteCheckResult.kuafu"
+                        :type="siteCheckResult.kuafu!.valid ? 'success' : 'danger'"
+                        style="margin-left:8px">{{ siteCheckResult.kuafu!.message }}</el-tag>
+                <span class="sub-text">只读探测登录态,不触发签到/回复;校验当前表单值,未保存也可先验</span>
+              </div>
+            </el-form-item>
             <span class="sub-text">夸父资源社(夸克为主混多盘);仅订阅的候选盘(主网盘/扩展网盘)包含夸克网盘时才参与搜索</span>
+          </el-tab-pane>
+          <el-tab-pane v-if="store.admin" label="聚影" name="jying">
+            <el-form-item label="站点">
+              <el-input v-model="notifyForm.jyingHost" placeholder="留空用内置地址 https://www.jying.top;自定义镜像站填 https://..."/>
+            </el-form-item>
+            <el-form-item label="账号">
+              <el-input v-model="notifyForm.jyingUsername" placeholder="推荐账号密码(Token 过期自动续期);站内可注册"/>
+            </el-form-item>
+            <el-form-item label="密码">
+              <el-input v-model="notifyForm.jyingPassword" type="password" show-password placeholder="与账号配套"/>
+            </el-form-item>
+            <el-form-item label="Token">
+              <el-input v-model="notifyForm.jyingToken" type="textarea" :rows="2"
+                        placeholder="可选;浏览器登录聚影后复制请求头 x-app-user-token(约 7 天,过期需手动更新);无凭证时网盘链接隐藏,该搜索源自动关闭"/>
+            </el-form-item>
+            <el-form-item label="有效性">
+              <div style="width:100%">
+                <el-button size="small" :loading="siteCheckLoading.jying" :disabled="!notifyLoaded"
+                           @click="checkSiteCookie('jying')">检查登录态</el-button>
+                <el-tag v-if="siteCheckResult.jying"
+                        :type="siteCheckResult.jying!.valid ? 'success' : 'danger'"
+                        style="margin-left:8px">{{ siteCheckResult.jying!.message }}</el-tag>
+                <span class="sub-text">Token 只读探测登录态;Token 未填时用账号密码实测登录,成功自动保存会话</span>
+              </div>
+            </el-form-item>
+            <span class="sub-text">聚影(jying.top)多盘资源聚合站(夸克/UC/阿里/115/百度/迅雷/光鸭/天翼/移动/123 + 磁力);资源解锁需登录</span>
           </el-tab-pane>
           <el-tab-pane v-if="store.admin" label="TG-Search" name="tgsearch">
             <el-form-item label="TG-Search地址">
@@ -892,37 +1164,34 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="navigationVisible" title="片单追更(豆瓣/TMDB 热门榜单选剧订阅)" width="960" top="3vh">
-      <div class="nav-toolbar">
-        <el-select v-model="navType" filterable style="width: 240px" @change="onNavTypeChange">
-          <el-option v-for="item in navCategories" :key="item.type_id" :label="item.type_name" :value="item.type_id"/>
-        </el-select>
-        <el-select v-for="f in navFilterDefs" :key="f.key" v-model="navFilters[f.key]" :placeholder="f.name"
-                   clearable style="width: 132px" @change="onNavFilterChange">
-          <el-option v-for="option in f.value" :key="option.v" :label="option.n" :value="option.v"/>
-        </el-select>
-        <span class="sub-text">共 {{ navTotal }} 条 · 点击追更补充季/网盘等信息:TMDB 条目自动绑定元数据,豆瓣条目自动匹配条目</span>
-      </div>
-      <div class="nav-grid" v-loading="navLoading">
-        <div v-for="item in navList" :key="item.vod_id" class="nav-card">
-          <el-image :src="item.vod_pic" fit="cover" class="nav-cover" lazy>
-            <template #error><div class="nav-cover nav-cover-placeholder">{{ (item.vod_name || '?').charAt(0) }}</div></template>
-          </el-image>
-          <div class="nav-title" :title="item.vod_name">{{ item.vod_name }}</div>
-          <div class="nav-meta">
-            <span v-if="item.vod_remarks">{{ item.vod_remarks }}</span>
-            <span v-if="item.vod_year">{{ item.vod_year }}</span>
-            <span v-if="item.type_name">{{ item.type_name }}</span>
+    <el-dialog v-model="panlianLoginVisible" title="盘链验证码登录" width="430">
+      <el-form label-width="70px" @submit.prevent>
+        <el-form-item label="账号">
+          <el-input v-model="panlianLoginForm.username" placeholder="邮箱或用户名" :disabled="panlianLoginSubmitting"/>
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input v-model="panlianLoginForm.password" type="password" show-password :disabled="panlianLoginSubmitting"/>
+        </el-form-item>
+        <el-form-item label="验证码">
+          <div style="display:flex;gap:8px;align-items:center;width:100%">
+            <el-input v-model="panlianLoginForm.captchaCode" placeholder="输入图中字符" style="width:150px"
+                      :disabled="panlianLoginSubmitting" @keyup.enter="submitPanlianCaptchaLogin"/>
+            <img v-if="panlianCaptchaImage" :src="panlianCaptchaImage" alt="验证码" title="点击刷新"
+                 style="height:42px;cursor:pointer;border-radius:4px" @click="refreshPanlianCaptcha"/>
+            <el-button v-else link type="primary" :loading="panlianCaptchaLoading" @click="refreshPanlianCaptcha">加载验证码</el-button>
+            <el-button v-if="panlianCaptchaImage" link @click="refreshPanlianCaptcha">看不清</el-button>
           </div>
-          <el-button v-if="isNavSubscribed(item)" size="small" disabled>已追更</el-button>
-          <el-button v-else size="small" type="primary" @click="navSubscribe(item)">追更</el-button>
-        </div>
-      </div>
-      <div class="nav-pager" v-if="navPageCount > 1">
-        <el-pagination background layout="prev, pager, next" :total="navTotal" :page-size="24"
-                       :current-page="navPage" @current-change="onNavPageChange"/>
-      </div>
+        </el-form-item>
+      </el-form>
+      <span class="sub-text">站点登录已启用图形验证码,账号密码无法自动重登;人工输码登录一次后会话 30 天内免重登(重启不丢)。新账号先「保存账号池」再登录</span>
+      <template #footer>
+        <el-button @click="panlianLoginVisible = false">取消</el-button>
+        <el-button type="primary" :loading="panlianLoginSubmitting" @click="submitPanlianCaptchaLogin">登录</el-button>
+      </template>
     </el-dialog>
+
+    <PianDanBrowser v-model="navigationVisible" :subscribed-names="navSubscribedNames"
+                    @subscribe="navSubscribe" @wanted="refreshEmbeddedWatchlist"/>
   </div>
 </template>
 
@@ -932,6 +1201,8 @@ import {useRouter} from 'vue-router'
 import axios from 'axios'
 import {ElMessage, ElMessageBox} from 'element-plus'
 import {store} from '@/services/store'
+import PianDanBrowser from '@/components/PianDanBrowser.vue'
+import WatchlistView from '@/views/WatchlistView.vue'
 
 /** 组件卸载统一清理延时刷新(检查/转存后的自动 reload):离开页面后不再触发孤儿请求 */
 const pendingTimers = new Set<number>()
@@ -949,7 +1220,6 @@ let detailSeq = 0
 let episodesSeq = 0
 let eventsSeq = 0
 let resourcesSeq = 0
-let navSeq = 0
 
 const router = useRouter()
 
@@ -981,6 +1251,7 @@ interface SubscriptionDto {
   stallCount: number
   checkIntervalHours: number | null
   customAirClock: string | null
+  airWeekdays: number[] | null
   nextCheckTime: number | null
   lastCheckTime: number | null
   resourceCount: number
@@ -989,6 +1260,7 @@ interface SubscriptionDto {
   mountPath: string | null
   crossDrive: boolean
   magnetOffline: boolean
+  selfShare: boolean
   filter: Filter | null
 }
 
@@ -1024,6 +1296,10 @@ interface ResourceDto {
   pinned: boolean
   /** 资源级起始集号:该资源第 1 集对应全剧第 N 集(null = 不平移) */
   startEpisode: number | null
+  /** 退役原因分类:DEAD(链接失效)/ALIEN(异剧)/TRANSIENT(瞬时故障);仅 RETIRED/REJECTED 行有值 */
+  failKind: string | null
+  /** 上次检测时间(epoch 毫秒) */
+  checkedTime: number | null
 }
 
 interface EventDto {
@@ -1131,6 +1407,20 @@ const loadGlobalMainDrives = () => {
   })
 }
 
+// 115 自有分享集数上限的展示值(订阅表单提示与实际配置一致;拉不到回落默认 200)
+const globalSelfShareLimit = ref(200)
+
+const loadGlobalSelfShareLimit = () => {
+  axios.get('/api/settings').then(response => {
+    const raw = (response.data || {})['msub_self_share_max_episodes'] || ''
+    const value = parseInt(raw)
+    if (!isNaN(value)) {
+      globalSelfShareLimit.value = value
+    }
+  }).catch(() => {
+  })
+}
+
 const globalMainDrivesLabel = computed(() => globalMainDrives.value.length
     ? `(${globalMainDrives.value.map(code => driveOptions.find(d => d.value === code)?.label || code).join('/')})`
     : '(未配置)')
@@ -1205,6 +1495,25 @@ const metaSearching = ref(false)
 const metaResults = ref<any[]>([])
 const metaLink = ref('')
 const resolvingLink = ref(false)
+/* 元数据搜索结果「想看」已加入标记(provider+id → 稍后再看,tmdb/db 条目带真 id,其余回落标题) */
+const wantedKeys = ref(new Set<string>())
+const wantMeta = (item: any) => {
+  const key = item.provider + item.id
+  if (wantedKeys.value.has(key)) return
+  const body: any = {title: item.name}
+  if (item.provider === 'tmdb') {
+    body.vodId = 'tmdb:tv:' + item.id
+  } else if (item.provider === 'douban') {
+    body.vodId = 'db:' + item.id
+  }
+  if (item.year) body.year = item.year
+  axios.post('/api/watchlist', body).then(({data}) => {
+    ElMessage.success(data.msg || '已加入稍后再看')
+    const next = new Set(wantedKeys.value)
+    next.add(key)
+    wantedKeys.value = next
+  })
+}
 const accounts = ref<any[]>([])
 /** 仅中转目标无服务端转存能力(与后端 resolveTargets 的 relayOnly 同口径):不列入转存网盘;历史已选中的保留显示便于取消 */
 const relayOnlyTypes = new Set(['QUARK_TV', 'UC_TV', 'OPEN115'])
@@ -1224,6 +1533,11 @@ const resources = ref<ResourceDto[]>([])
 const addResourceVisible = ref(false)
 const addResourceSaving = ref(false)
 const addResourceForm = ref({link: '', password: ''})
+// 网盘目录 tab(issue #1071):目录树懒加载 + 选中路径
+const addResourceTab = ref<'dir' | 'link'>('dir')
+const dirTreeKey = ref(0)
+const dirTreeLoading = ref(false)
+const selectedDirPath = ref('')
 // 手动磁力补缺:贴磁力/ed2k 提交全局离线下载账号补缺集(集号留空按文件名自动识别);
 // 搜索区按订阅关键词搜候选(TG-Search,与自动兜底同源),结果可解析看包内容、可入库提交
 const magnetVisible = ref(false)
@@ -1290,11 +1604,251 @@ const loadPanSouAuth = () => {
     panSouAuthEnabled.value = false
   })
 }
+interface PanLianAccountStatusDto {
+  identity: string
+  username?: string | null
+  email?: string | null
+  cookieBased: boolean
+  status: string
+  message?: string | null
+  exhaustedToday: boolean
+  checkinDone: boolean
+  checkinBonus: number
+  quotaRemaining: number
+  quotaLimit: number
+  quotaUsed: number
+}
+interface PanLianAccountRow {
+  type: 'account' | 'cookie'
+  username: string
+  password: string
+  cookie: string
+}
+const parsePanlianAccounts = (raw: string): PanLianAccountRow[] => {
+  if (!raw.trim()) return []
+  try {
+    const list = JSON.parse(raw)
+    if (!Array.isArray(list)) return []
+    return list.flatMap((item: any): PanLianAccountRow[] => {
+      if (item && typeof item.cookie === 'string' && item.cookie.trim()) {
+        return [{type: 'cookie' as const, username: '', password: '', cookie: item.cookie.trim()}]
+      }
+      const username = (item?.username ?? '').toString().trim()
+      const password = item?.password == null ? '' : String(item.password)
+      if (username && password) {
+        return [{type: 'account' as const, username, password, cookie: ''}]
+      }
+      return []
+    })
+  } catch {
+    return []
+  }
+}
+const panlianAccountRows = ref<PanLianAccountRow[]>([])
+const panlianAccounts = ref<PanLianAccountStatusDto[]>([])
+const panlianStatusLoading = ref(false)
+const loadPanlianAccounts = () => {
+  panlianStatusLoading.value = true
+  axios.get('/api/media-subscriptions/panlian/accounts').then(response => {
+    panlianAccounts.value = response.data || []
+  }).catch(() => {
+    panlianAccounts.value = []
+  }).finally(() => {
+    panlianStatusLoading.value = false
+  })
+}
+// 盘链验证码登录:站点 2026-09-26 起登录强制图形验证码,账号密码形态靠人工输码建立会话
+const panlianLoginVisible = ref(false)
+const panlianCaptchaLoading = ref(false)
+const panlianLoginSubmitting = ref(false)
+const panlianCaptchaImage = ref('')
+const panlianLoginForm = ref({username: '', password: '', captchaId: '', captchaCode: ''})
+const refreshPanlianCaptcha = () => {
+  panlianCaptchaLoading.value = true
+  panlianCaptchaImage.value = ''
+  axios.get('/api/media-subscriptions/panlian/captcha').then(response => {
+    panlianCaptchaImage.value = response.data?.image || ''
+    panlianLoginForm.value.captchaId = response.data?.captchaId || ''
+    panlianLoginForm.value.captchaCode = ''
+  }).catch(() => {
+    ElMessage.error('验证码获取失败')
+  }).finally(() => {
+    panlianCaptchaLoading.value = false
+  })
+}
+const openPanlianCaptchaLogin = (username = '', password = '') => {
+  panlianLoginForm.value.username = username || notifyForm.value.panlianUsername || ''
+  panlianLoginForm.value.password = password || notifyForm.value.panlianPassword || ''
+  panlianLoginForm.value.captchaCode = ''
+  panlianLoginVisible.value = true
+  refreshPanlianCaptcha()
+}
+const submitPanlianCaptchaLogin = () => {
+  const form = panlianLoginForm.value
+  if (!form.username || !form.password || !form.captchaCode) {
+    ElMessage.warning('请填写账号、密码与验证码')
+    return
+  }
+  panlianLoginSubmitting.value = true
+  axios.post('/api/media-subscriptions/panlian/captcha-login', form).then(response => {
+    const data = response.data
+    if (data?.success) {
+      ElMessage.success('盘链登录成功,会话已保存(30 天内免重登)')
+      panlianLoginVisible.value = false
+      loadPanlianAccounts()
+    } else {
+      ElMessage.error(data?.message || '登录失败')
+      refreshPanlianCaptcha()
+    }
+  }).catch(() => ElMessage.error('登录请求失败')).finally(() => {
+    panlianLoginSubmitting.value = false
+  })
+}
+// 玩偶聚合域名状态:后端每小时定时探测(可达性+延迟,自动采用延迟最低的可达域名),此面板看快照/手动立即探测
+interface WanouDomainStatusDto {
+  url: string
+  ok: boolean
+  latencyMs: number
+  error?: string | null
+}
+interface WanouSiteStatusDto {
+  siteId: string
+  siteName: string
+  ok: boolean
+  bestUrl?: string | null
+  domains: WanouDomainStatusDto[]
+}
+const wanouDomainVisible = ref(false)
+const wanouSites = ref<WanouSiteStatusDto[]>([])
+const wanouStatusLoading = ref(false)
+const wanouProbing = ref(false)
+// 站点最低延迟=可达域名中最小延迟(即当前采用域名的延迟);全域名不可达为 null
+const wanouMinLatency = (site: WanouSiteStatusDto): number | null => {
+  const lats = site.domains.filter((d: WanouDomainStatusDto) => d.ok).map((d: WanouDomainStatusDto) => d.latencyMs)
+  return lats.length ? Math.min(...lats) : null
+}
+const sortedWanouSites = computed(() => [...wanouSites.value].sort((a, b) => {
+  const la = wanouMinLatency(a)
+  const lb = wanouMinLatency(b)
+  if (la === null && lb === null) return 0
+  if (la === null) return 1
+  if (lb === null) return -1
+  return la - lb
+}))
+const loadWanouDomains = () => {
+  wanouStatusLoading.value = true
+  axios.get('/api/media-subscriptions/wanou/domains').then(response => {
+    wanouSites.value = response.data || []
+  }).catch(() => {
+    wanouSites.value = []
+  }).finally(() => {
+    wanouStatusLoading.value = false
+  })
+}
+const openWanouDomains = () => {
+  wanouDomainVisible.value = true
+  loadWanouDomains()
+}
+const probeWanouDomains = () => {
+  wanouProbing.value = true
+  axios.post('/api/media-subscriptions/wanou/domains/probe').then(response => {
+    wanouSites.value = response.data || []
+    const alive = (response.data || []).filter((s: WanouSiteStatusDto) => s.ok).length
+    ElMessage.success(`探测完成:${alive}/${(response.data || []).length} 个站点可用,已自动采用延迟最低的域名`)
+  }).catch(() => ElMessage.error('探测请求失败')).finally(() => {
+    wanouProbing.value = false
+  })
+}
+/** 外部站点凭证有效性检查:校验表单当前值(未保存也可先验),结果就地展示;
+ *  观影/蜗牛支持账号密码形态(Cookie 未填时实测登录,成功自动保存会话) */
+const siteFormFields: Record<string, { cookie: string, host: string, username?: string, password?: string }> = {
+  guanying: {cookie: 'guanyingCookie', host: 'guanyingHost', username: 'guanyingUsername', password: 'guanyingPassword'},
+  woniu: {cookie: 'woniuCookie', host: 'woniuHost', username: 'woniuUsername', password: 'woniuPassword'},
+  zencang: {cookie: 'zencangCookie', host: 'zencangHost'},
+  pan123community: {cookie: 'pan123communityCookie', host: 'pan123communityHost'},
+  kuafu: {cookie: 'kuafuCookie', host: 'kuafuHost'},
+  jying: {cookie: 'jyingToken', host: 'jyingHost', username: 'jyingUsername', password: 'jyingPassword'},
+}
+const siteCheckLoading = ref<Record<string, boolean>>({})
+const siteCheckResult = ref<Record<string, { valid: boolean, message: string } | undefined>>({})
+const checkSiteCookie = (site: string) => {
+  const fields = siteFormFields[site]
+  if (!fields) {
+    return
+  }
+  const form = notifyForm.value as unknown as Record<string, string>
+  const cookie = String(form[fields.cookie] ?? '').trim()
+  const username = fields.username ? String(form[fields.username] ?? '').trim() : ''
+  const password = fields.password ? String(form[fields.password] ?? '') : ''
+  if (!cookie && !(username && password)) {
+    ElMessage.warning(fields.username ? '未填写 Token/Cookie 或账号密码' : '未填写 Cookie')
+    return
+  }
+  siteCheckLoading.value[site] = true
+  axios.post('/api/media-subscriptions/site-credentials/check', {
+    site,
+    cookie,
+    host: String(form[fields.host] ?? '').trim(),
+    username,
+    password,
+  }).then(response => {
+    const data = response.data
+    const valid = !!data?.valid
+    const message = data?.message || (valid ? '凭证有效' : '凭证无效')
+    siteCheckResult.value[site] = {valid, message}
+    if (valid) {
+      ElMessage.success(message)
+    } else {
+      ElMessage.error(message)
+    }
+  }).catch(() => {
+    siteCheckResult.value[site] = undefined
+    ElMessage.error('检查请求失败')
+  }).finally(() => {
+    siteCheckLoading.value[site] = false
+  })
+}
+/** 账号池独立输入行 → JSON 存储值({"username","password"}/{"cookie"},残行丢弃) */
+const panlianPoolJson = () => JSON.stringify(panlianAccountRows.value.reduce(
+    (pool: ({ username: string, password: string } | { cookie: string })[], row: PanLianAccountRow) => {
+      if (row.type === 'cookie') {
+        const cookie = row.cookie.trim()
+        if (cookie) {
+          pool.push({cookie})
+        }
+      } else {
+        const username = row.username.trim()
+        if (username && row.password) {
+          pool.push({username, password: row.password})
+        }
+      }
+      return pool
+    }, []))
+const panlianPoolSaving = ref(false)
+/** 只保存账号池,不关设置对话框;保存成功后自动刷新账号状态 */
+const savePanlianPool = () => {
+  if (!notifyLoaded.value) {
+    ElMessage.warning('设置项尚未加载成功,暂不能保存(防止覆盖为空)')
+    return
+  }
+  panlianPoolSaving.value = true
+  axios.post('/api/settings', {name: 'panlian_accounts', value: panlianPoolJson()})
+      .then(() => {
+        ElMessage.success('账号池已保存')
+        loadPanlianAccounts()
+      })
+      .catch(() => ElMessage.error('账号池保存失败'))
+      .finally(() => {
+        panlianPoolSaving.value = false
+      })
+}
 const notifyForm = ref({
   botToken: '',
   chatId: '',
   quietHours: '',
+  botProxy: '',
   botEnabled: true,
+  collectionFallback: false,
   doubanCookie: '',
   archiveDays: 0,
   magnetEpisodeQuota: 2,
@@ -1303,6 +1857,8 @@ const notifyForm = ref({
   tmdbApiKey: '',
   tmdbApiHost: '',
   vipAccounts: [] as number[],
+  selfShareEnabled: false,
+  selfShareMaxEpisodes: 200,
   mainDrives: [] as number[],
   extendedDrives: [] as number[],
   poolMinQuality: '',
@@ -1328,6 +1884,10 @@ const notifyForm = ref({
   pan123communityCookie: '',
   kuafuHost: '',
   kuafuCookie: '',
+  jyingHost: '',
+  jyingUsername: '',
+  jyingPassword: '',
+  jyingToken: '',
   panSouUrl: '',
   panSouUsername: '',
   panSouPassword: '',
@@ -1358,27 +1918,26 @@ const panSouLinkCheckTypeOptions = [
 ]
 const tmdbApiHostOptions = [
   {label: '官方 API(直连)', value: ''},
-  {label: 'Worker 轮询池 - round robin 分摊每日限额', value: 'https://tmdb.8866033.xyz,https://tmdb.swust-oj.workers.dev,https://tmdb.8866033.workers.dev,https://tmdb.power348045.workers.dev,https://tmdb.harold348047.workers.dev,https://tmdb.ai-09b.workers.dev,https://tmdb.root-df0.workers.dev,https://tmdb.atv-8c1.workers.dev,https://tmdb.odd-math-a42b.workers.dev,https://tmdb.test-d2c.workers.dev,https://tmdb.code-a96.workers.dev,https://tmdb.claude-b79.workers.dev'},
-  {label: 'NAStool(API + 图床分线路,自动配置)', value: 'https://tmdb.nastool.org'},
+  {label: 'Worker 轮询池 - round robin', value: 'worker-pool'},
+  {label: 'itv666 代理', value: 'http://tmdb.itv666.cc'},
+  {label: 'NAStool 代理', value: 'https://tmdb.nastool.org'},
 ]
 const navigationVisible = ref(false)
-const navCategories = ref<{ type_id: string, type_name: string }[]>([])
-const navAllFilters = ref<Record<string, any[]>>({})
-const navFilterDefs = ref<any[]>([])
-const navFilters = ref<Record<string, string>>({})
-const navType = ref('douban:hot_tv')
-const navList = ref<any[]>([])
-const navPage = ref(1)
-const navPageCount = ref(1)
-const navTotal = ref(0)
-const navLoading = ref(false)
+/** 主体视图切换:我的追剧 / 稍后再看(想看队列整页并入,菜单不再单列) */
+const mainTab = ref('subs')
+/** 嵌入想看面板引用:片单追更里加了想看时,面板已挂载(lazy)才需要就地刷新,未挂载时挂载即拉新 */
+const watchlistRef = ref<any>(null)
+const refreshEmbeddedWatchlist = () => watchlistRef.value?.load?.()
 const navSubscribed = ref<Set<string>>(new Set())
+/** 片单榜单组件「已追更」回显:刚订阅成功的临时标记 + 订阅列表标题 */
+const navSubscribedNames = computed(() => Array.from(new Set([...navSubscribed.value, ...subscriptions.value.map(s => s.name)])))
 /** 从片单追更打开新建对话框的条目:创建成功后标记"已追更",对话框关闭即解除 */
 const navPending = ref<any>(null)
 
 onMounted(() => {
   loadAll()
   loadGlobalMainDrives()
+  loadGlobalSelfShareLimit()
   loadGlobalPoolFilter()
   axios.get('/api/pan/accounts').then(response => {
     accounts.value = response.data || []
@@ -1399,65 +1958,6 @@ onMounted(() => {
 
 const openNavigation = () => {
   navigationVisible.value = true
-  if (!navCategories.value.length) {
-    axios.get('/api/media-subscriptions/navigation').then(response => {
-      // CategoryList 的分类字段经 @JsonProperty 序列化为 "class"
-      navCategories.value = ((response.data['class'] || []) as any[]).filter((c: any) => c.type_id && c.type_id !== '0')
-      navAllFilters.value = response.data.filters || {}
-      if (!navCategories.value.some(c => c.type_id === navType.value)) {
-        navType.value = navCategories.value[0]?.type_id || ''
-      }
-      applyNavFilters()
-      loadNavList()
-    }).catch(() => ElMessage.error('片单分类加载失败'))
-  }
-}
-
-/** 分类切换:换用该分类的筛选定义(地区/年代/排序等,TVBox filter 同源),已选筛选清空。 */
-const applyNavFilters = () => {
-  navFilterDefs.value = navAllFilters.value[navType.value] || []
-  navFilters.value = {}
-}
-
-const onNavTypeChange = () => {
-  navPage.value = 1
-  applyNavFilters()
-  loadNavList()
-}
-
-const onNavFilterChange = () => {
-  navPage.value = 1
-  loadNavList()
-}
-
-const onNavPageChange = (page: number) => {
-  navPage.value = page
-  loadNavList()
-}
-
-const loadNavList = () => {
-  if (!navType.value) return
-  navLoading.value = true
-  const params: any = {t: navType.value, pg: navPage.value, size: 24}
-  Object.entries(navFilters.value).forEach(([key, value]) => {
-    if (value) {
-      params[key] = value // 空串 = "全部"选项,不传参
-    }
-  })
-  const my = ++navSeq
-  axios.get('/api/media-subscriptions/navigation/list', {params}).then(response => {
-    if (my !== navSeq) return
-    const data = response.data || {}
-    navList.value = data.list || []
-    navPageCount.value = data.pagecount || 1
-    navTotal.value = data.total || navList.value.length
-  }).catch(() => ElMessage.error('片单加载失败,该分类可能依赖外部接口')).finally(() => {
-    if (my === navSeq) navLoading.value = false
-  })
-}
-
-const isNavSubscribed = (item: any) => {
-  return navSubscribed.value.has(item.vod_name) || subscriptions.value.some(s => s.name === item.vod_name)
 }
 
 /** 追更按钮 → 打开新建订阅对话框预填榜单条目,由用户补充(季/网盘/过滤等)后确认创建 */
@@ -1472,11 +1972,12 @@ const navSubscribe = (item: any) => {
   const vodId = String(item.vod_id || '')
   if (vodId.startsWith('tmdb:')) {
     // tmdb:tv:{id} / tmdb:movie:{id}:绑定元数据,官方集数/播出日程驱动追更;
+    // 电影条目 metaId 带 movie: 前缀(tv/movie 两个命名空间,裸 id 会绑到无关剧集);
     // 缺标识时不绑定,用户在对话框按标题提交即纯标题订阅
     const metaId = vodId.split(':')[2]
     if (metaId) {
       form.value.metaProvider = 'tmdb'
-      form.value.metaId = metaId
+      form.value.metaId = vodId.startsWith('tmdb:movie:') ? 'movie:' + metaId : metaId
     }
     return
   }
@@ -1538,8 +2039,10 @@ const handleAdd = () => {
     accountIds: [] as string[],
     crossDrive: false,
     magnetOffline: false,
+    selfShare: false,
     checkIntervalHours: 6,
     customAirClock: null,
+    airWeekdays: [] as number[],
     mainDrives: [] as number[],
     driveTypes: [],
     qualities: [],
@@ -1576,8 +2079,10 @@ const handleEdit = (row: SubscriptionDto) => {
     accountIds: row.accountIds?.length ? row.accountIds : (row.accountId ? ['pan:' + row.accountId] : []),
     crossDrive: !!row.crossDrive,
     magnetOffline: !!row.magnetOffline,
+    selfShare: !!row.selfShare,
     checkIntervalHours: row.checkIntervalHours ?? 6,
     customAirClock: row.customAirClock ?? null,
+    airWeekdays: row.airWeekdays || [],
     mainDrives: row.mainDrives || [],
     driveTypes: row.filter?.driveTypes || [],
     qualities: row.filter?.qualities || [],
@@ -1680,8 +2185,10 @@ const buildBody = () => ({
   accountIds: form.value.accountIds,
   crossDrive: form.value.crossDrive,
   magnetOffline: form.value.magnetOffline,
+    selfShare: form.value.selfShare,
   checkIntervalHours: form.value.checkIntervalHours,
   customAirClock: form.value.customAirClock || '',
+  airWeekdays: [...new Set(form.value.airWeekdays || [])],
   mainDrives: [...new Set(form.value.mainDrives || [])].slice(0, 2),
   filter: {
     driveTypes: form.value.driveTypes,
@@ -1837,6 +2344,9 @@ const resourceShareLink = (row: ResourceDto) => {
   return link + (link.includes('?') ? '&' : '?') + param + '=' + password
 }
 
+/** 路径资源(link=path:/…):用户粘贴的已挂载网盘目录,直连供流,不参与转主源。 */
+const isPathRow = (row: ResourceDto) => !!row.link?.startsWith('path:')
+
 const showResources = (row: SubscriptionDto) => {
   current.value = row
   resourcesVisible.value = true
@@ -1855,11 +2365,46 @@ const loadResources = () => {
   })
 }
 
-/** 手动添加候选资源:只入池不挂载不动主源(用户反馈"一启用就变主资源"的解法 ——
- *  添加与启用两个动作分开;同链幂等,曾移除/判死的复活回候选池)。 */
+/** 手动添加候选资源:分享链接只入池不挂载不动主源(用户反馈"一启用就变主资源"的解法 ——
+ *  添加与启用两个动作分开;同链幂等,曾移除/判死的复活回候选池);
+ *  网盘目录 tab(issue #1071):目录树选择器选中即路径资源即时入账。 */
 const openAddResource = () => {
   addResourceForm.value = {link: '', password: ''}
+  addResourceTab.value = 'dir'
+  selectedDirPath.value = ''
+  dirTreeKey.value++ // 树重挂载:重新懒加载根层(已挂载存储)
   addResourceVisible.value = true
+}
+
+interface DriveDirNode {
+  name: string
+  path: string
+}
+
+/** 目录树懒加载:一层一层拉子目录(后端只回目录名),根层 = 已挂载存储列表。 */
+const loadDriveDirs = (node: any, resolve: (dirs: DriveDirNode[]) => void) => {
+  const parent = node.level === 0 ? '' : String(node.data?.path || '')
+  dirTreeLoading.value = true
+  axios.get('/api/media-subscriptions/drive-dirs', {params: parent ? {path: parent} : {}}).then(({data}) => {
+    const names = (data as string[]) || []
+    resolve(names.map(name => ({name, path: parent + '/' + name})))
+  }).catch(error => {
+    ElMessage.error(error?.response?.data?.message || error?.message || '目录加载失败')
+    resolve([])
+  }).finally(() => {
+    dirTreeLoading.value = false
+  })
+}
+
+const onDirNodeClick = (data: DriveDirNode) => {
+  selectedDirPath.value = data.path
+}
+
+/** 目录 tab 提交:选中路径走同一 addResource 接口(裸路径形态 → 路径资源即时入账)。 */
+const submitAddDirResource = () => {
+  if (!current.value || !selectedDirPath.value) return
+  addResourceSaving.value = true
+  postAddResource(selectedDirPath.value, null)
 }
 
 const openManualMagnet = () => {
@@ -1970,21 +2515,34 @@ const submitAddResource = () => {
   if (!current.value) return
   const link = addResourceForm.value.link.trim()
   if (!link) {
-    ElMessage.warning('请粘贴分享链接')
+    ElMessage.warning('请粘贴分享链接或网盘目录路径')
     return
   }
   addResourceSaving.value = true
-  axios.post(`/api/media-subscriptions/${current.value.id}/resources`, {
+  postAddResource(link, addResourceForm.value.password.trim() || null)
+}
+
+/** 添加资源统一提交与回执(分享链接候选入池 / 路径资源即时入账两形态共用)。 */
+const postAddResource = (link: string, password: string | null) => {
+  axios.post(`/api/media-subscriptions/${current.value!.id}/resources`, {
     link,
-    password: addResourceForm.value.password.trim() || null,
+    password,
   }).then(response => {
-    if (response.data?.existed) {
+    if (response.data?.episodes !== undefined) {
+      // 路径资源:即时入账,响应带识别出的集数
+      ElMessage.success(response.data.existed
+          ? '路径资源已在池中,已刷新目录内容'
+          : `已入账路径资源,识别出 ${response.data.episodes} 集可直接播放`)
+    } else if (response.data?.existed) {
       ElMessage.success('该链接已在资源池中,提取码已按填写更新')
     } else {
       ElMessage.success(response.data?.revived ? '已复活为候选(下轮巡检重探)' : '已加入候选池,巡检/补缺时自动探测')
     }
     addResourceVisible.value = false
     loadResources()
+    if (response.data?.episodes !== undefined) {
+      schedule(loadAll, 1000) // 集数清单/进度随入账变化,刷新主页行
+    }
   }).finally(() => {
     addResourceSaving.value = false
   })
@@ -2014,7 +2572,7 @@ const activateResource = (resource: ResourceDto) => {
 const pinResource = (resource: ResourceDto) => {
   if (!current.value) return
   axios.post(`/api/media-subscriptions/${current.value.id}/resources/${resource.id}/pin`).then(() => {
-    ElMessage.success('已钉选为主源,自动换源不再覆盖')
+    ElMessage.success('已钉选为主源:强制指定,自动换源与异剧判定不再覆盖(仅链接真死时换走,恢复后优先回归)')
     schedule(loadResources, 6000)
     schedule(loadAll, 8000)
   })
@@ -2044,6 +2602,8 @@ const removeResource = (resource: ResourceDto) => {
   }).catch(() => {})
 }
 
+/** 恢复资源:手动移除(REMOVED)墓碑与判死退役/盘检拒绝(RETIRED/REJECTED)都可手动复活 ——
+ *  检测错误(风控窗口误判死等)不等冷却期满,立即回候选池下轮重探。 */
 const restoreResource = (resource: ResourceDto) => {
   if (!current.value) return
   axios.post(`/api/media-subscriptions/${current.value.id}/resources/${resource.id}/restore`).then(() => {
@@ -2136,6 +2696,17 @@ const checkFromDetail = () => {
       reloadDetail()
       loadAll()
     }, 6000)
+  })
+}
+
+/** 固化分享(115 自有分享手动批次):可看集转存自有 115 盘建永久分享后删源,结果消息回显 */
+const selfShareNow = (row: SubscriptionDto) => {
+  axios.post(`/api/media-subscriptions/${row.id}/self-share`).then((response) => {
+    ElMessage.success(String(response.data?.message || '完成'))
+    schedule(() => {
+      reloadDetail()
+      loadAll()
+    }, 3000)
   })
 }
 
@@ -2273,7 +2844,9 @@ const openNotify = () => {
     notifyForm.value.botToken = settings['msub_telegram_bot_token'] || ''
     notifyForm.value.chatId = settings['msub_telegram_chat_id'] || ''
     notifyForm.value.quietHours = settings['msub_notify_quiet_hours'] || ''
+    notifyForm.value.botProxy = settings['msub_telegram_proxy'] || ''
     notifyForm.value.botEnabled = settings['msub_telegram_bot_enabled'] !== 'false'
+    notifyForm.value.collectionFallback = settings['msub_collection_fallback'] === 'true'
     notifyForm.value.doubanCookie = settings['douban_cookie'] || ''
     notifyForm.value.tmdbApiKey = settings['tmdb_api_key'] || ''
     notifyForm.value.tmdbApiHost = settings['tmdb_api_host'] || ''
@@ -2283,6 +2856,8 @@ const openNotify = () => {
     notifyForm.value.magnetTotalQuota = parseInt(settings['msub_magnet_total_quota'] || '200') || 200
     notifyForm.value.vipAccounts = (settings['msub_vip_accounts'] || '')
         .split(',').map((v: string) => parseInt(v.trim())).filter((v: number) => v > 0)
+    notifyForm.value.selfShareEnabled = (settings['msub_self_share_enabled'] || '') === 'true'
+    notifyForm.value.selfShareMaxEpisodes = parseInt(settings['msub_self_share_max_episodes'] || '200') || 200
     notifyForm.value.mainDrives = (settings['msub_main_drives'] || '')
         .split(',').map((v: string) => parseInt(v.trim())).filter((v: number) => v > 0).slice(0, 2)
     notifyForm.value.extendedDrives = (settings['msub_extended_drives'] || '')
@@ -2294,6 +2869,8 @@ const openNotify = () => {
     notifyForm.value.poolMinEpisodeSizeMb = poolFilter.minEpisodeSizeMb
     notifyForm.value.poolMaxEpisodeSizeMb = poolFilter.maxEpisodeSizeMb
     notifyForm.value.panlianHost = settings['panlian_host'] || ''
+    // 账号池 JSON 拆行回填:{"username","password"} 或 {"cookie"} → 独立输入行
+    panlianAccountRows.value = parsePanlianAccounts(settings['panlian_accounts'] || '')
     notifyForm.value.panlianUsername = settings['panlian_username'] || ''
     notifyForm.value.panlianPassword = settings['panlian_password'] || ''
     notifyForm.value.panlianCookie = settings['panlian_cookie'] || ''
@@ -2311,6 +2888,10 @@ const openNotify = () => {
     notifyForm.value.pan123communityCookie = settings['pan123community_cookie'] || ''
     notifyForm.value.kuafuHost = settings['kuafu_host'] || ''
     notifyForm.value.kuafuCookie = settings['kuafu_cookie'] || ''
+    notifyForm.value.jyingHost = settings['jying_host'] || ''
+    notifyForm.value.jyingUsername = settings['jying_username'] || ''
+    notifyForm.value.jyingPassword = settings['jying_password'] || ''
+    notifyForm.value.jyingToken = settings['jying_token'] || ''
     notifyForm.value.panSouUrl = settings['pan_sou_url'] || ''
     notifyForm.value.panSouUsername = settings['pan_sou_username'] || ''
     notifyForm.value.panSouPassword = settings['pan_sou_password'] || ''
@@ -2331,6 +2912,7 @@ const openNotify = () => {
     if (notifyForm.value.panSouUrl) {
       loadPanSouAuth()
     }
+    siteCheckResult.value = {}
     notifyLoaded.value = true
     notifyVisible.value = true
   }).catch(() => {
@@ -2349,7 +2931,9 @@ const saveNotify = () => {
     axios.post('/api/settings', {name: 'msub_telegram_bot_token', value: notifyForm.value.botToken}),
     axios.post('/api/settings', {name: 'msub_telegram_chat_id', value: notifyForm.value.chatId}),
     axios.post('/api/settings', {name: 'msub_notify_quiet_hours', value: notifyForm.value.quietHours.trim()}),
+    axios.post('/api/settings', {name: 'msub_telegram_proxy', value: notifyForm.value.botProxy.trim()}),
     axios.post('/api/settings', {name: 'msub_telegram_bot_enabled', value: String(notifyForm.value.botEnabled)}),
+    axios.post('/api/settings', {name: 'msub_collection_fallback', value: String(notifyForm.value.collectionFallback)}),
     axios.post('/api/settings', {name: 'douban_cookie', value: notifyForm.value.doubanCookie}),
     axios.post('/api/settings', {name: 'tmdb_api_key', value: notifyForm.value.tmdbApiKey}),
     axios.post('/api/settings', {name: 'tmdb_api_host', value: notifyForm.value.tmdbApiHost}),
@@ -2362,6 +2946,8 @@ const saveNotify = () => {
     axios.post('/api/settings', {name: 'msub_magnet_subscription_quota', value: String(notifyForm.value.magnetSubscriptionQuota)}),
     axios.post('/api/settings', {name: 'msub_magnet_total_quota', value: String(notifyForm.value.magnetTotalQuota)}),
     axios.post('/api/settings', {name: 'msub_vip_accounts', value: notifyForm.value.vipAccounts.join(',')}),
+    axios.post('/api/settings', {name: 'msub_self_share_enabled', value: String(notifyForm.value.selfShareEnabled)}),
+    axios.post('/api/settings', {name: 'msub_self_share_max_episodes', value: String(notifyForm.value.selfShareMaxEpisodes)}),
     axios.post('/api/settings', {
       name: 'msub_main_drives',
       value: [...new Set(notifyForm.value.mainDrives)].slice(0, 2).join(','),
@@ -2375,6 +2961,8 @@ const saveNotify = () => {
       value: poolFilterValue,
     }),
     axios.post('/api/settings', {name: 'panlian_host', value: notifyForm.value.panlianHost.trim()}),
+    // 账号池:独立输入行合并回 JSON 数组({"username","password"} 或 {"cookie"},残行丢弃)
+    axios.post('/api/settings', {name: 'panlian_accounts', value: panlianPoolJson()}),
     axios.post('/api/settings', {name: 'panlian_username', value: notifyForm.value.panlianUsername.trim()}),
     axios.post('/api/settings', {name: 'panlian_password', value: notifyForm.value.panlianPassword}),
     axios.post('/api/settings', {name: 'panlian_cookie', value: notifyForm.value.panlianCookie.trim()}),
@@ -2392,6 +2980,10 @@ const saveNotify = () => {
     axios.post('/api/settings', {name: 'pan123community_cookie', value: notifyForm.value.pan123communityCookie.trim()}),
     axios.post('/api/settings', {name: 'kuafu_host', value: notifyForm.value.kuafuHost.trim()}),
     axios.post('/api/settings', {name: 'kuafu_cookie', value: notifyForm.value.kuafuCookie.trim()}),
+    axios.post('/api/settings', {name: 'jying_host', value: notifyForm.value.jyingHost.trim()}),
+    axios.post('/api/settings', {name: 'jying_username', value: notifyForm.value.jyingUsername.trim()}),
+    axios.post('/api/settings', {name: 'jying_password', value: notifyForm.value.jyingPassword}),
+    axios.post('/api/settings', {name: 'jying_token', value: notifyForm.value.jyingToken.trim()}),
     axios.post('/api/settings', {name: 'pan_sou_url', value: notifyForm.value.panSouUrl.trim()}),
     axios.post('/api/settings', {name: 'pan_sou_username', value: notifyForm.value.panSouUsername.trim()}),
     axios.post('/api/settings', {name: 'pan_sou_password', value: notifyForm.value.panSouPassword}),
@@ -2503,6 +3095,7 @@ const weightDefs: { key: string; label: string; value: number }[] = [
   { key: 'source.zencang', label: '123臻藏源', value: 12 },
   { key: 'source.pan123community', label: '123社区源', value: 12 },
   { key: 'source.kuafu', label: '夸父源', value: 12 },
+  { key: 'source.jying', label: '聚影源', value: 12 },
   { key: 'baidu.free', label: '百度免会员', value: 17 },
   { key: 'pan115', label: '115追更弱', value: -10 },
   { key: 'pack.complete', label: '完结包', value: -6 },
@@ -2520,6 +3113,7 @@ const matrixStateType = (state: string) => {
   if (state === 'VERIFIED' || state === 'TRANSFER') return 'success'
   if (state === 'FAILED') return 'danger'
   if (state === 'MISSING') return 'info'
+  if (state === 'FALLBACK') return 'primary'
   return 'warning' // LISTED:列得出、未验证
 }
 
@@ -2529,6 +3123,7 @@ const matrixStateLabel = (src: { state: string }) => {
     case 'FAILED': return '✗ 取链失败'
     case 'MISSING': return '文件已消失'
     case 'TRANSFER': return '已转存'
+    case 'FALLBACK': return '采集直链'
     default: return '未验证'
   }
 }
@@ -2551,6 +3146,18 @@ const stateLabel = (state: string | null) => {
   }
 }
 
+/** 退役/拒绝行的原因文本(状态标签 tooltip):分类 + 上次检测时间,判断是否误判走「恢复」 */
+const retireReasonText = (resource: ResourceDto) => {
+  const kind = resource.failKind
+  const reason = kind === 'DEAD' ? '链接失效'
+      : kind === 'ALIEN' ? '内容与订阅不符(异剧)'
+      : kind === 'POLICY' ? '单集体积不在筛选范围(追剧设置-资源筛选可调)'
+      : kind === 'TRANSIENT' ? '瞬时故障连续超限'
+      : '未知(旧数据)'
+  const checked = resource.checkedTime ? `,检测于 ${formatTime(resource.checkedTime)}` : ''
+  return `退役原因:${reason}${checked};若是误判可点「恢复」回候选池重探`
+}
+
 const eventType = (type: string) => {
   switch (type) {
     case 'NEW_EPISODE':
@@ -2564,6 +3171,7 @@ const eventType = (type: string) => {
       return 'danger'
     case 'SOURCE_REPLACED':
     case 'DRIVE_LINE':
+    case 'SELF_SHARE':
       return 'primary'
     default:
       return 'info'
@@ -2586,6 +3194,7 @@ const eventTypeName = (type: string) => {
     ENDED: '完结',
     RESUMED: '自动重开',
     UPDATE_CHECK: '更新检查',
+    SELF_SHARE: '自有分享',
   }
   return names[type] || type
 }
@@ -2633,7 +3242,12 @@ const airedInSeason = (row: SubscriptionDto): number => (row.officialEpisodes ??
 const formatTime = (time: number | null) => {
   if (!time) return '-'
   // 与后端日程分桶同口径(北京时间):非东八区浏览器上避免「今天」格子与钟点互相矛盾
-  return new Date(time).toLocaleString('zh-CN', {hour12: false, timeZone: 'Asia/Shanghai'})
+  // 带周几(欧美剧/追番周播,「周六 04:00」一眼对上更新日);秒无信息量,去掉换列宽
+  return new Date(time).toLocaleString('zh-CN', {
+    hour12: false, timeZone: 'Asia/Shanghai',
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    weekday: 'short', hour: '2-digit', minute: '2-digit',
+  })
 }
 
 const formatClock = (time: number) => {
@@ -3022,69 +3636,6 @@ const formatClock = (time: number) => {
 
 .meta-info {
   font-size: 13px;
-}
-
-.nav-toolbar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 10px;
-  margin-bottom: 12px;
-}
-
-.nav-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
-  gap: 12px;
-  min-height: 200px;
-}
-
-.nav-card {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  gap: 4px;
-}
-
-.nav-cover {
-  width: 100%;
-  aspect-ratio: 2 / 3;
-  border-radius: 4px;
-  background: var(--el-fill-color);
-}
-
-.nav-cover-placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 28px;
-  color: var(--el-text-color-secondary);
-  background: var(--el-fill-color-dark);
-}
-
-.nav-title {
-  font-size: 13px;
-  line-height: 1.3;
-  height: 34px;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-
-.nav-meta {
-  display: flex;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  min-height: 18px;
-}
-
-.nav-pager {
-  display: flex;
-  justify-content: center;
-  margin-top: 14px;
 }
 
 .episode-filter {

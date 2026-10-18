@@ -24,7 +24,7 @@ class LocalDoubanMatchTest {
     private final MediaSubscriptionService service = new MediaSubscriptionService(
             null, null, null, null, null, null,
             movieRepository, null, null, null, null, null, null, null,
-            new AppProperties(), new ObjectMapper(), null, null);
+            new AppProperties(), new ObjectMapper(), null, null, null);
 
     private static Movie movie(int id, String name, Integer year) {
         Movie movie = new Movie();
@@ -43,6 +43,12 @@ class LocalDoubanMatchTest {
         // 标题自带 @ 或后缀非数字:整体按标题解析,不误拆
         assertEquals(new PianDanService.NameYear("测试@剧", null), PianDanService.parseSubjectId("s:测试@剧"));
         assertEquals(new PianDanService.NameYear("测试剧@春夏", null), PianDanService.parseSubjectId("s:测试剧@春夏"));
+    }
+
+    @Test
+    void doubanSubjectIdIsPureDigits() {
+        // db: 独立类型:纯数字不嵌标题,爬虫裸拼 GET 时 &/#/空格 均无从截断
+        assertEquals("db:36155031", PianDanService.doubanSubjectId(36155031));
     }
 
     @Test
@@ -79,5 +85,17 @@ class LocalDoubanMatchTest {
         when(movieRepository.getByName("无此剧")).thenReturn(List.of());
         assertNull(service.localDoubanId("无此剧", 2024));
         assertNull(service.localDoubanDetail("无此剧", 2024));
+    }
+
+    @Test
+    void detailByIdHitsLocalRowDirectly() {
+        when(movieRepository.findById(36155031)).thenReturn(java.util.Optional.of(movie(36155031, "榜单剧", 2025)));
+        // id 直取:同名翻拍/年份错位都不再是障碍,id 命中即该条目
+        MovieDetail detail = service.localDoubanDetailById(36155031);
+        assertEquals("榜单剧", detail.getVod_name());
+        assertEquals("2025", detail.getVod_year());
+        // 本地库无该行(榜单新片):null 由调用方回落在线解析
+        assertNull(service.localDoubanDetailById(99999999));
+        assertNull(service.localDoubanDetailById(null));
     }
 }

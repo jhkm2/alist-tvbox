@@ -73,6 +73,101 @@ class H2MigrationTest {
     }
 
     /**
+     * #1076:SQL 备份恢复路径(FlywayRepairConfig)把库 baseline 到最高版本,历史表只有
+     * 一条 baseline 行——没有 V6 行,V6 永远不会执行,但 validate 因 baseline 覆盖而通过。
+     * 回调绝不能把真列挪走等 V6 重建:那会删列后无人恢复,validate 报 missing column
+     * [login_ip] 进入崩溃循环。
+     */
+    @Test
+    void callbackKeepsColumnsWhenSchemaAlreadyPassedV6() throws Exception {
+        String url = "jdbc:h2:mem:v6-schema-past-6;DB_CLOSE_DELAY=-1";
+        try (Connection connection = DriverManager.getConnection(url, "sa", "")) {
+            createSessionTableWithLoginColumns(connection);
+            baselineAtCurrentVersion(url);
+
+            Flyway flyway = callbackEnabledFlyway(url);
+
+            assertThatCode(flyway::migrate).doesNotThrowAnyException();
+            assertThat(queryString(connection, "SELECT login_ip FROM session WHERE token = 'token-1'"))
+                    .isEqualTo("127.0.0.1");
+            assertThat(queryString(connection, "SELECT user_agent FROM session WHERE token = 'token-1'"))
+                    .isEqualTo("Mozilla/5.0");
+            // 不得留下挪列痕迹
+            assertThatThrownBy(() -> execute(connection, "SELECT login_ip_v6_existing FROM session"))
+                    .hasMessageContaining("not found");
+        }
+    }
+
+    /**
+     * #1076 崩溃循环库的自愈:旧版回调已在无 V6 历史行的库上把真列改名成 *_v6_existing,
+     * 修复后的回调要把临时列原名改回,数据无损恢复,而不是要求临时列与真列同时存在才动作。
+     */
+    @Test
+    void callbackRenamesAsideColumnsBackWhenV6WillNeverRun() throws Exception {
+        String url = "jdbc:h2:mem:v6-rename-aside-back;DB_CLOSE_DELAY=-1";
+        try (Connection connection = DriverManager.getConnection(url, "sa", "")) {
+            createSessionTableWithLoginColumns(connection);
+            baselineAtCurrentVersion(url);
+            // 复现 1.108.0 损坏形态:真列已被挪成临时列
+            execute(connection, "ALTER TABLE session RENAME COLUMN login_ip TO login_ip_v6_existing");
+            execute(connection, "ALTER TABLE session RENAME COLUMN user_agent TO user_agent_v6_existing");
+
+            Flyway flyway = callbackEnabledFlyway(url);
+
+            assertThatCode(flyway::migrate).doesNotThrowAnyException();
+            assertThat(queryString(connection, "SELECT login_ip FROM session WHERE token = 'token-1'"))
+                    .isEqualTo("127.0.0.1");
+            assertThat(queryString(connection, "SELECT user_agent FROM session WHERE token = 'token-1'"))
+                    .isEqualTo("Mozilla/5.0");
+            assertThatThrownBy(() -> execute(connection, "SELECT login_ip_v6_existing FROM session"))
+                    .hasMessageContaining("not found");
+        }
+    }
+
+    /**
+     * #1076 极端形态:列被彻底删掉(手工清理或异常路径),既无真列也无临时列。
+     * V6 无法重跑时回调须直接补列,让 Hibernate validate 通过。
+     */
+    @Test
+    void callbackRecreatesMissingColumnsWhenV6WillNeverRun() throws Exception {
+        String url = "jdbc:h2:mem:v6-recreate-missing;DB_CLOSE_DELAY=-1";
+        try (Connection connection = DriverManager.getConnection(url, "sa", "")) {
+            createSessionTableWithLoginColumns(connection);
+            baselineAtCurrentVersion(url);
+            execute(connection, "ALTER TABLE session DROP COLUMN login_ip");
+            execute(connection, "ALTER TABLE session DROP COLUMN user_agent");
+
+            Flyway flyway = callbackEnabledFlyway(url);
+
+            assertThatCode(flyway::migrate).doesNotThrowAnyException();
+            assertThatCode(() -> execute(connection, "UPDATE session SET login_ip = '127.0.0.1',"
+                    + " user_agent = 'Mozilla/5.0' WHERE token = 'token-1'")).doesNotThrowAnyException();
+        }
+    }
+
+    /** 复现 FlywayRepairConfig 的 SQL 恢复形态:业务表齐全、无历史表,baseline 到最高版本。 */
+    private void baselineAtCurrentVersion(String url) {
+        Flyway.configure()
+                .dataSource(url, "sa", "")
+                .locations("classpath:db/migration/h2", "classpath:db/migration/common",
+                        "classpath:db/migration/current")
+                .baselineVersion("56")
+                .baselineDescription("SQL backup restore: schema present, history table missing")
+                .load()
+                .baseline();
+    }
+
+    private Flyway callbackEnabledFlyway(String url) {
+        return Flyway.configure()
+                .dataSource(url, "sa", "")
+                .locations("classpath:db/migration/h2", "classpath:db/migration/common",
+                        "classpath:db/migration/current")
+                .callbacks(new SessionLoginInfoMigrationCallback())
+                .baselineOnMigrate(true)
+                .load();
+    }
+
+    /**
      * V10 在 H2 上必须能跑完:CREATE TABLE 未加引号,H2 把列存为大写,
      * 若后续 DDL 直接引用小写 "token"/"source_kind",迁移会以 Column not found 中断,应用起不来。
      * 断言用裸标识符访问(与 Hibernate、ddl-auto=validate 一致)。
@@ -125,6 +220,16 @@ class H2MigrationTest {
                     "INSERT INTO playback_tombstone (id, uid, scope, source_kind, source_key, vod_id, deleted_at, expire_at)"
                             + " VALUES (1, 1, 'item', 'site', 'abc', 'v1', 300, 400)"))
                     .doesNotThrowAnyException();
+
+            // V56 watchlist_item 稍后再看:(uid, vod_id) 唯一索引防重复加入
+            assertThatCode(() -> execute(connection,
+                    "INSERT INTO watchlist_item (id, uid, vod_id, status, title, created_time)"
+                            + " VALUES (1, 1, 'tmdb:tv:42', 'WANT', '测试剧', 0)"))
+                    .doesNotThrowAnyException();
+            assertThatThrownBy(() -> execute(connection,
+                    "INSERT INTO watchlist_item (id, uid, vod_id, status, title, created_time)"
+                            + " VALUES (2, 1, 'tmdb:tv:42', 'WANT', '测试剧', 0)"))
+                    .hasMessageContaining("Unique index or primary key violation");
         }
     }
 
@@ -174,6 +279,49 @@ class H2MigrationTest {
             assertThat(indexColumns(connection, "PLAYBACK_TOMBSTONE", "idx_pb_tomb"))
                     .containsExactly("UID", "SOURCE_KIND", "SOURCE_KEY");
         }
+    }
+
+    /**
+     * V54 给 offline_download_task 加 cleanup_attempts 是裸 INT(无默认值),存量行该列为 NULL,
+     * 而实体 OfflineDownloadTask.cleanupAttempts 是 primitive int —— 备份导出 findAll()/定时备份/
+     * 清理调度加载存量行即抛 "Null value was assigned to a property ... of primitive type"。
+     * V55 必须把存量 NULL 回填为 0。测试库是新库永远造不出这种行,须手动复现 V1 既有表 + 存量行。
+     */
+    @Test
+    void v55BackfillsNullCleanupAttemptsOnLegacyOfflineTasks() throws Exception {
+        String url = "jdbc:h2:mem:v55-cleanup-attempts-backfill;DB_CLOSE_DELAY=-1";
+        try (Connection connection = DriverManager.getConnection(url, "sa", "")) {
+            // 空库先只跑 V1,复现生产起始形态(全量 schema;预建单表会触发 baseline 跳过 V1,不可取)
+            migrateTo(url, "1");
+            // V54 之前的存量离线任务行
+            execute(connection, "INSERT INTO offline_download_task (id, url_hash) VALUES (1, 'hash-1')");
+
+            // 链路跑到 V54 为止:加列裸 INT 无默认值,存量行 cleanup_attempts = NULL(线上炸点)
+            migrateTo(url, "54");
+            assertThat(queryString(connection,
+                    "SELECT CAST(cleanup_attempts AS VARCHAR) FROM offline_download_task WHERE id = 1"))
+                    .isNull();
+
+            // V55 继续跑:NULL 全部回填为 0,实体 primitive int 可正常读回
+            runFullMigration(url);
+            assertThat(appliedVersions(connection)).contains("55");
+            assertThat(queryString(connection,
+                    "SELECT CAST(cleanup_attempts AS VARCHAR) FROM offline_download_task WHERE id = 1"))
+                    .isEqualTo("0");
+            assertThat(queryString(connection,
+                    "SELECT CAST(COUNT(*) AS VARCHAR) FROM offline_download_task WHERE cleanup_attempts IS NULL"))
+                    .isEqualTo("0");
+        }
+    }
+
+    private void migrateTo(String url, String target) {
+        Flyway.configure()
+                .dataSource(url, "sa", "")
+                .locations("classpath:db/migration/h2", "classpath:db/migration/common",
+                        "classpath:db/migration/current")
+                .target(target)
+                .load()
+                .migrate();
     }
 
     private List<String> indexColumns(Connection connection, String table, String indexName) throws Exception {

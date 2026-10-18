@@ -47,6 +47,8 @@ class PlayControllerTest {
     private PianDanService pianDanService;
     @Mock
     private cn.har01d.alist_tvbox.service.AccountAccessGuard accountAccessGuard;
+    @Mock
+    private cn.har01d.alist_tvbox.service.WatchlistService watchlistService;
 
     private MockMvc mockMvc;
 
@@ -57,7 +59,7 @@ class PlayControllerTest {
                 new cn.har01d.alist_tvbox.service.PianDanSubscriptionService(
                         mediaSubscriptionService, checkService, pianDanService);
         PlayController controller = new PlayController(tvBoxService, biliBiliService, subscriptionService, proxyService,
-                mediaSubscriptionService, pianDanSubscriptionService, accountAccessGuard);
+                mediaSubscriptionService, pianDanSubscriptionService, accountAccessGuard, watchlistService);
         mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new RestErrorHandler())
                 .build();
@@ -86,6 +88,32 @@ class PlayControllerTest {
     void playShouldRejectMalformedMediaSubscriptionEpisodeId() throws Exception {
         mockMvc.perform(get("/play/test-token").param("id", "msubep-5"))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void playShouldAddWatchlistEntry() throws Exception {
+        when(mediaSubscriptionService.resolveUid("test-token")).thenReturn(7);
+        when(watchlistService.add(7, "tmdb:tv:42|测试剧"))
+                .thenReturn(new cn.har01d.alist_tvbox.service.WatchlistService.Result(
+                        false, "测试剧", "已加入稍后再看《测试剧》"));
+
+        mockMvc.perform(get("/play/test-token").param("id", "watchadd-tmdb:tv:42|测试剧"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("已加入稍后再看《测试剧》"));
+        verifyNoInteractions(tvBoxService, biliBiliService, proxyService, pianDanService);
+    }
+
+    @Test
+    void playShouldRemoveWatchlistEntry() throws Exception {
+        when(mediaSubscriptionService.resolveUid("test-token")).thenReturn(7);
+        when(watchlistService.remove(7, "tmdb:tv:42|测试剧"))
+                .thenReturn(new cn.har01d.alist_tvbox.service.WatchlistService.Result(
+                        true, "测试剧", "已移出稍后再看《测试剧》"));
+
+        mockMvc.perform(get("/play/test-token").param("id", "watchdel-tmdb:tv:42|测试剧"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("已移出稍后再看《测试剧》"));
+        verifyNoInteractions(tvBoxService, biliBiliService, proxyService, pianDanService);
     }
 
     @Test
@@ -175,6 +203,23 @@ class PlayControllerTest {
     }
 
     @Test
+    void playShouldSubscribePianDanTmdbMovieEntryWithNamespacedMetaId() throws Exception {
+        when(mediaSubscriptionService.resolveUid("test-token")).thenReturn(7);
+        when(mediaSubscriptionService.isSubscribedTitle(7, "测试电影")).thenReturn(true);
+
+        // 电影条目:metaId 带 movie: 前缀(tv/movie 两个命名空间,裸 id 会被当剧集绑到无关条目)
+        mockMvc.perform(get("/play/test-token").param("id", "msubadd-tmdb:movie:438631|测试电影"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("《测试电影》已在追剧中"));
+        org.mockito.Mockito.verify(mediaSubscriptionService)
+                .create(org.mockito.ArgumentMatchers.eq(7), org.mockito.ArgumentMatchers.argThat(request ->
+                        "测试电影".equals(request.getName()) && "tmdb".equals(request.getMetaProvider())
+                                && "movie:438631".equals(request.getMetaId())));
+        org.mockito.Mockito.verifyNoInteractions(checkService);
+        verifyNoInteractions(tvBoxService, biliBiliService, proxyService, pianDanService);
+    }
+
+    @Test
     void playShouldRejectUnknownPianDanEntry() throws Exception {
         when(mediaSubscriptionService.resolveUid("test-token")).thenReturn(7);
         mockMvc.perform(get("/play/test-token").param("id", "msubadd-xxx:1"))
@@ -232,5 +277,59 @@ class PlayControllerTest {
         mockMvc.perform(get("/play/test-token").param("id", "msubdel-s:showa"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.msg").value("《showa》未在追剧中"));
+    }
+
+    @Test
+    void playShouldReportBilibiliActionStatus() throws Exception {
+        when(biliBiliService.getActionStatusText("116958703918865"))
+                .thenReturn("点赞: 未点赞  投币: 未投币  收藏: 未收藏");
+
+        mockMvc.perform(get("/play/test-token").param("id", "bilistat-116958703918865"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("点赞: 未点赞  投币: 未投币  收藏: 未收藏"));
+        verifyNoInteractions(tvBoxService, proxyService, mediaSubscriptionService);
+    }
+
+    @Test
+    void playShouldRunBilibiliLikeAction() throws Exception {
+        when(biliBiliService.runActionText("116958703918865", "like")).thenReturn("点赞成功");
+
+        mockMvc.perform(get("/play/test-token").param("id", "bililike-116958703918865"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("点赞成功"));
+        verifyNoInteractions(tvBoxService, proxyService, mediaSubscriptionService);
+    }
+
+    @Test
+    void playShouldRunBilibiliWatchLaterAction() throws Exception {
+        when(biliBiliService.runActionText("116958703918865", "watchlater")).thenReturn("已加入稍后再看");
+
+        mockMvc.perform(get("/play/test-token").param("id", "biliwatch-116958703918865"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("已加入稍后再看"));
+        verifyNoInteractions(tvBoxService, proxyService, mediaSubscriptionService);
+    }
+
+    @Test
+    void playShouldRouteBilibiliActionIdArrivingAsBvid() throws Exception {
+        // 版本错位兜底(2026-10-11 实战):旧 spider jar 未拦截 biliwatch-,点击走默认播放路径把动作条目 id
+        // 当 bvid 发上来;须归位到 id 分发执行动作,而非拆出 avid=biliwatch 撞 -400 风控文案
+        when(biliBiliService.runActionText("117360333757002", "watchlater")).thenReturn("已加入稍后再看");
+
+        mockMvc.perform(get("/play/test-token").param("bvid", "biliwatch-117360333757002").param("from", "jar"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("已加入稍后再看"));
+        verifyNoInteractions(tvBoxService, proxyService, mediaSubscriptionService);
+    }
+
+    @Test
+    void playShouldReportBilibiliActionFailureAsMsg() throws Exception {
+        // 未登录/投满/上游错误走 msg 通道回执(TVBox 端 Toast),不炸 400
+        when(biliBiliService.runActionText("116958703918865", "coin"))
+                .thenThrow(new cn.har01d.alist_tvbox.exception.BadRequestException("已达投币上限(2 枚)"));
+
+        mockMvc.perform(get("/play/test-token").param("id", "bilicoin-116958703918865"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.msg").value("已达投币上限(2 枚)"));
     }
 }

@@ -30,6 +30,8 @@ public class MediaSubscriptionDto {
     private boolean crossDrive;
     /** 磁力兜底(仅转存模式生效) */
     private boolean magnetOffline;
+    /** 115 自有分享(仅挂载模式生效) */
+    private boolean selfShare;
     private String status;
     private Integer expectedEpisodes;
     /** 手动锁定总集数(null = 跟随官方) */
@@ -41,6 +43,8 @@ public class MediaSubscriptionDto {
     private Integer checkIntervalHours;
     /** 手动播出时刻校正("HH:mm",空=自动) */
     private String customAirClock;
+    /** 手动更新日(ISO 周一=1..周日=7,null/空 = 不限制:巡检只落配置周几的播出时刻) */
+    private List<Integer> airWeekdays;
     private Long nextCheckTime;
     private Long lastCheckTime;
     private int resourceCount;

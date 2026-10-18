@@ -7,6 +7,7 @@ import cn.har01d.alist_tvbox.dto.OpenApiDto;
 import cn.har01d.alist_tvbox.dto.ParseRequest;
 import cn.har01d.alist_tvbox.dto.ShareLink;
 import cn.har01d.alist_tvbox.dto.SharesDto;
+import cn.har01d.alist_tvbox.dto.StorageReloadProgress;
 import cn.har01d.alist_tvbox.entity.AListAlias;
 import cn.har01d.alist_tvbox.entity.AListAliasRepository;
 import cn.har01d.alist_tvbox.entity.Account;
@@ -84,10 +85,13 @@ import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -126,6 +130,20 @@ public class ShareService {
     private final ObjectMapper objectMapper;
     private final UserService userService;
 
+    private static final int RELOAD_ALL_PAGE_SIZE = 500;
+    /** 风控/限流失败特征(判定整盘跳过):百度 errno -62/-19/-65 家族 + 通用限流措辞。
+     *  errno 支须兼容 reload 报错的 {@code (errno=-62)} 括号形态(PowerList baiduErrnoMessage 翻译文案)
+     *  与未翻译裸 body 的 {@code "errno":-62} JSON 形态。 */
+    private static final Pattern RELOAD_THROTTLED = Pattern.compile(
+            "(?i)errno\\s*[=:]\\s*(-62|-19|-65)|触发百度风控|访问频率太快|操作过于频繁|验证次数过多|请稍[后候]|too many (requests|attempts)|rate.?limit|\\b429\\b");
+    private final AtomicBoolean reloadAllRunning = new AtomicBoolean();
+    private volatile boolean reloadAllCancelled;
+    private volatile Thread reloadAllThread;
+    private final StorageReloadProgress reloadProgress = new StorageReloadProgress();
+
+    record FailedStorageRef(int id, String driver) {
+    }
+
     public ShareService(AppProperties appProperties,
                         ShareRepository shareRepository,
                         MetaRepository metaRepository,
@@ -163,7 +181,7 @@ public class ShareService {
         this.environment = environment;
         this.objectMapper = objectMapper;
         this.userService = userService;
-        this.restTemplate = builder.rootUri("http://localhost:" + aListLocalService.getInternalPort()).build();
+        this.restTemplate = builder.rootUri("http://localhost:" + aListLocalService.getInternalPort()).connectTimeout(Duration.ofSeconds(10)).readTimeout(Duration.ofSeconds(60)).build();
     }
 
     @PostConstruct
@@ -831,9 +849,16 @@ public class ShareService {
         Optional<Account> ali = uid == 0 ? accountRepository.getFirstByMasterTrue()
                 : accountRepository.findFirstByOwnerUidOrderByIdAsc(uid);
         ali.ifPresent(account -> {
+            // access token 都是 2h TTL、调度按天刷,下发前按需续期(过期才刷,防频控);
+            // 开放域 token 给 xs jar 等开放平台客户端用(openFile 列表),消费域给 user/get 校验;
+            // nick_name 是 xs jar aliyun.txt 的 homeContent 登录门判定字段(空则客户端播种哑值)
+            accountService.ensureFreshAccessTokens(account);
             ObjectNode node = result.putObject("ali");
             node.put("refresh_token", account.getRefreshToken());
             node.put("access_token", account.getAccessToken());
+            node.put("open_refresh_token", account.getOpenToken());
+            node.put("open_access_token", account.getOpenAccessToken());
+            node.put("nick_name", account.getNickname() == null ? "" : account.getNickname());
         });
 
         putToken(result, "139", account(DriverType.PAN139, uid).map(DriverAccount::getToken).orElse("").trim());
@@ -1312,6 +1337,8 @@ public class ShareService {
                         .trim();
                 throw new BadRequestException(error);
             }
+        } else {
+            touchTempShare(path);
         }
         Site site = siteRepository.findById(1).orElseThrow();
 
@@ -1325,6 +1352,21 @@ public class ShareService {
         }
 
         return path;
+    }
+
+    // 临时分享按"最后使用"滑动续期:add() 命中既有挂载时刷新 time。否则过期
+    // 判断以首次挂载时间为准,追更剧集每 72h 被定时清理一次,下一次播放要重新
+    // enable 百度分享存储(实测 ~4.8s 网络初始化),显著拖慢网盘起播。
+    private void touchTempShare(String path) {
+        try {
+            Share existing = shareRepository.findByPath(path);
+            if (existing != null && existing.isTemp()) {
+                existing.setTime(Instant.now());
+                shareRepository.save(existing);
+            }
+        } catch (Exception e) {
+            log.warn("touch temp share failed: {}", path, e);
+        }
     }
 
     // Short-lived link -> title cache populated at search time (before the Share row
@@ -1358,8 +1400,13 @@ public class ShareService {
         if (probe == null) {
             return null;
         }
-        return shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId())
+        // The same (type, shareId) can legitimately have multiple rows (subscription
+        // mount + temp push, different passwords); pick the first row that has a title
+        // instead of a unique-result query that throws on duplicates.
+        return shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).stream()
                 .map(Share::getTitle)
+                .filter(StringUtils::isNotBlank)
+                .findFirst()
                 .orElse(null);
     }
 
@@ -1375,7 +1422,7 @@ public class ShareService {
             if (probe == null) {
                 return;
             }
-            shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).ifPresent(share -> {
+            shareRepository.findByTypeAndShareId(probe.getType(), probe.getShareId()).forEach(share -> {
                 if (!Objects.equals(title, share.getTitle())) {
                     share.setTitle(title);
                     shareRepository.save(share);
@@ -1428,7 +1475,7 @@ public class ShareService {
 
             shareRepository.save(share);
 
-            String error = enableStorage(share.getId(), token);
+            String error = enableStorageAwaitingSnapshot(share.getId(), token);
             share.setError(error);
             if (appProperties.isCleanInvalidShares() && invalid(error)) {
                 shareRepository.delete(share);
@@ -1573,38 +1620,78 @@ public class ShareService {
         }
     }
 
+    /** 115 新建分享是快照语义:建完立刻挂载(追剧自有分享首批/补批)时,服务端可能尚未生成完快照,
+     * enable(init 即列分享根目录)必报「正在生成文件快照」。该态秒级自愈,按退避重试等就绪;
+     * 其它错误原样返回。重试节奏抽成方法供测试替换(免真实 sleep)。 */
+    private static final long[] SNAPSHOT_RETRY_DELAYS_MILLIS = {3_000, 5_000, 10_000, 20_000, 30_000};
+
+    static boolean isSnapshotPending(String error) {
+        return error != null && error.contains("正在生成文件快照");
+    }
+
+    long[] snapshotRetryDelayMillis() {
+        return SNAPSHOT_RETRY_DELAYS_MILLIS;
+    }
+
+    String enableStorageAwaitingSnapshot(Integer id, String token) {
+        String error = enableStorage(id, token);
+        long[] delays = snapshotRetryDelayMillis();
+        for (int i = 0; isSnapshotPending(error) && i < delays.length; i++) {
+            log.warn("storage {} enable blocked by pending share snapshot, retry {}/{} in {}ms: {}",
+                    id, i + 1, delays.length, delays[i], error);
+            try {
+                Thread.sleep(delays[i]);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            error = enableStorage(id, token);
+        }
+        return error;
+    }
+
     public void deleteShares(List<Integer> ids) {
         aListLocalService.validateAListStatus();
         for (Integer id : ids) {
             try {
-                shareRepository.deleteById(id);
+                // 先清 AList 侧再删本地行:AList 调用失败时本地行保留,可重试;反序在 AList 失败时留下无句柄的孤儿 storage
                 String token = accountService.login();
                 deleteStorage(id, token);
+                shareRepository.deleteById(id);
             } catch (Exception e) {
-                log.warn("{}", e.getMessage());
+                log.warn("delete share {} failed: {}", id, e.getMessage());
             }
         }
     }
 
     public void deleteShare(Integer id) {
         aListLocalService.validateAListStatus();
-        shareRepository.deleteById(id);
+        // 先清 AList 侧再删本地行:AList 调用失败时本地行保留,删除可重试(重删已消失的 storage 无副作用)
         String token = accountService.login();
         deleteStorage(id, token);
+        shareRepository.deleteById(id);
     }
 
     public int deleteShares(String drive) {
         Integer type = DriveId.toTypeOrNull(drive);
         List<Share> shares = type != null ? shareRepository.findByType(type) : shareRepository.findAll();
-        shareRepository.deleteAll(shares);
-        log.info("delete {} shares type: {}", shares.size(), type);
+        List<Share> removable = shares;
         if (aListLocalService.getStatus() != 0) {
+            // AList 在运行:逐条先清 AList 侧,失败的保留本地行待重试,只删已清理的
             String token = accountService.login();
+            removable = new ArrayList<>(shares.size());
             for (Share share : shares) {
-                deleteStorage(share.getId(), token);
+                try {
+                    deleteStorage(share.getId(), token);
+                    removable.add(share);
+                } catch (Exception e) {
+                    log.warn("delete storage {} failed, keep share row: {}", share.getId(), e.getMessage());
+                }
             }
         }
-        return shares.size();
+        shareRepository.deleteAll(removable);
+        log.info("delete {} shares type: {}", removable.size(), type);
+        return removable.size();
     }
 
     public void deleteStorage(Integer id, String token) {
@@ -1622,6 +1709,16 @@ public class ShareService {
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(null, headers);
         ResponseEntity<JsonNode> response = restTemplate.exchange("/api/admin/storage/failed?page=" + pageable.getPageNumber() + "&per_page=" + pageable.getPageSize(), HttpMethod.GET, entity, JsonNode.class);
         return response.getBody();
+    }
+
+    /** 路径归属存储的驱动名(追剧手动路径资源标注盘线路);找不到返回 null,不校验 AList 状态(尽力而为)。 */
+    public String findStorageDriverByPath(String path) {
+        try {
+            return aListLocalService.findStorageDriverByPath(path);
+        } catch (Exception e) {
+            log.warn("find storage driver by path failed: {}", e.getMessage());
+            return null;
+        }
     }
 
     public void validateStorages() {
@@ -1698,6 +1795,170 @@ public class ShareService {
         ResponseEntity<Response> response = restTemplate.exchange("/api/admin/storage/reload?id=" + id, HttpMethod.POST, entity, Response.class);
         log.debug("reload storage {}: {}", id, response.getBody());
         return response.getBody();
+    }
+
+    public StorageReloadProgress getReloadAllProgress() {
+        return reloadProgress;
+    }
+
+    public StorageReloadProgress startReloadAllStorages(long intervalMs) {
+        if (intervalMs < 0 || intervalMs > 600_000) {
+            throw new BadRequestException("间隔必须在 0-600000 毫秒之间");
+        }
+        if (!reloadAllRunning.compareAndSet(false, true)) {
+            throw new BadRequestException("批量重载正在进行中");
+        }
+        reloadAllCancelled = false;
+        // 进度在启动线程同步初始化:后台线程被调度前查询方就能看到 running=true,不会误判"已完成";
+        // running=true 必须最后置位,否则并发查询会看到新任务叠加上一轮残留计数
+        reloadProgress.setCancelled(false);
+        reloadProgress.setTotal(0);
+        reloadProgress.setProcessed(0);
+        reloadProgress.setSuccess(0);
+        reloadProgress.setFailed(0);
+        reloadProgress.setThrottled(0);
+        reloadProgress.setThrottledDrivers(Set.of());
+        reloadProgress.setError(null);
+        reloadProgress.setInterval(intervalMs);
+        reloadProgress.setStartedTime(System.currentTimeMillis());
+        reloadProgress.setFinishedTime(0);
+        reloadProgress.setRunning(true);
+        Thread thread = new Thread(() -> {
+            try {
+                doReloadAllStorages(intervalMs);
+            } catch (Exception e) {
+                // doReloadAllStorages 内部不总揽异常,逃逸到这里必须收尾进度,
+                // 否则 running 永久 true、前端轮询不停
+                log.error("reload all storages crashed", e);
+                reloadProgress.setError("批量重载异常中断: " + e.getMessage());
+                finishReloadAll();
+            } finally {
+                reloadAllRunning.set(false);
+                reloadAllThread = null;
+            }
+        }, "storage-reload-all");
+        reloadAllThread = thread;
+        thread.start();
+        return reloadProgress;
+    }
+
+    public StorageReloadProgress cancelReloadAllStorages() {
+        if (reloadAllRunning.get()) {
+            reloadAllCancelled = true;
+            Thread thread = reloadAllThread;
+            if (thread != null) {
+                thread.interrupt();
+            }
+            log.info("cancel reload all storages requested");
+        }
+        return reloadProgress;
+    }
+
+    void doReloadAllStorages(long intervalMs) {
+        List<FailedStorageRef> storages;
+        try {
+            storages = collectFailedStorages();
+        } catch (Exception e) {
+            log.warn("collect failed storages failed", e);
+            reloadProgress.setError("获取失效资源列表失败: " + e.getMessage());
+            finishReloadAll();
+            return;
+        }
+
+        reloadProgress.setTotal(storages.size());
+        log.info("reload all storages begin: {} items, interval {}ms", storages.size(), intervalMs);
+
+        // 某网盘触发风控说明该盘在风控窗口内,继续请求必然失败且可能加重风控:
+        // 记下驱动名,后续同盘条目直接跳过(不请求),其他网盘正常处理
+        Set<String> throttledDrivers = new HashSet<>();
+        boolean first = true;
+        for (FailedStorageRef storage : storages) {
+            if (reloadAllCancelled) {
+                log.info("reload all storages cancelled at {}/{}", reloadProgress.getProcessed(), storages.size());
+                break;
+            }
+            if (storage.driver() != null && throttledDrivers.contains(storage.driver())) {
+                reloadProgress.setThrottled(reloadProgress.getThrottled() + 1);
+                reloadProgress.setProcessed(reloadProgress.getSuccess() + reloadProgress.getFailed() + reloadProgress.getThrottled());
+                continue;
+            }
+            if (!first && intervalMs > 0) {
+                try {
+                    Thread.sleep(intervalMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            first = false;
+            boolean ok = false;
+            String errorText = null;
+            try {
+                Response response = reloadStorage(storage.id());
+                if (response != null && response.getCode() != null && response.getCode() == 200) {
+                    ok = true;
+                } else {
+                    errorText = response == null ? "empty response" : response.getMessage();
+                }
+            } catch (Exception e) {
+                if (reloadAllCancelled) {
+                    break;
+                }
+                errorText = e.getMessage();
+            }
+            if (ok) {
+                reloadProgress.setSuccess(reloadProgress.getSuccess() + 1);
+            } else if (isThrottledReload(errorText)) {
+                log.warn("reload storage {} throttled ({}): {}, skip remaining storages of this driver",
+                        storage.id(), storage.driver(), errorText);
+                if (storage.driver() != null) {
+                    throttledDrivers.add(storage.driver());
+                    reloadProgress.setThrottledDrivers(Set.copyOf(throttledDrivers));
+                }
+                reloadProgress.setThrottled(reloadProgress.getThrottled() + 1);
+            } else {
+                log.warn("reload storage {} failed: {}", storage.id(), errorText);
+                reloadProgress.setFailed(reloadProgress.getFailed() + 1);
+            }
+            reloadProgress.setProcessed(reloadProgress.getSuccess() + reloadProgress.getFailed() + reloadProgress.getThrottled());
+        }
+        if (reloadAllCancelled) {
+            reloadProgress.setCancelled(true);
+        }
+        finishReloadAll();
+        log.info("reload all storages end: total {} success {} failed {} throttled {} cancelled {}",
+                reloadProgress.getTotal(), reloadProgress.getSuccess(), reloadProgress.getFailed(),
+                reloadProgress.getThrottled(), reloadProgress.isCancelled());
+    }
+
+    private boolean isThrottledReload(String message) {
+        return message != null && RELOAD_THROTTLED.matcher(message).find();
+    }
+
+    private void finishReloadAll() {
+        reloadProgress.setRunning(false);
+        reloadProgress.setFinishedTime(System.currentTimeMillis());
+    }
+
+    List<FailedStorageRef> collectFailedStorages() {
+        List<FailedStorageRef> storages = new ArrayList<>();
+        // AList 侧页码从 1 开始,cleanStorages 的 PageRequest.of(1, size) 同口径
+        for (int page = 1; ; page++) {
+            JsonNode result = listStorages(PageRequest.of(page, RELOAD_ALL_PAGE_SIZE));
+            JsonNode content = result == null ? null : result.get("data").get("content");
+            if (!(content instanceof ArrayNode array)) {
+                break;
+            }
+            for (JsonNode item : array) {
+                JsonNode driver = item.get("driver");
+                storages.add(new FailedStorageRef(item.get("id").asInt(),
+                        driver == null ? null : driver.asText()));
+            }
+            if (array.size() < RELOAD_ALL_PAGE_SIZE) {
+                break;
+            }
+        }
+        return storages;
     }
 
     private List<Share> loadLatestShare() {

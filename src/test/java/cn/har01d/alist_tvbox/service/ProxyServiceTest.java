@@ -168,4 +168,77 @@ interface ProxyCase {
             }
         }
     }
+
+    // ---------- 上游错误透传(downloadStraight) ----------
+
+    /** 起一个本地 HTTP 服务按给定状态码回包,返回其根地址。 */
+    private static String stubUpstream(int status, String body) throws java.io.IOException {
+        com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/html");
+            exchange.sendResponseHeaders(status, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> server.stop(0)));
+        return "http://127.0.0.1:" + server.getAddress().getPort() + "/upstream";
+    }
+
+    /** 上游 412(夸克 CDN 风控页)不得被 getInputStream() 的异常包成 Spring 500:状态码与错误体须原样透传。 */
+    @Test
+    void downloadStraightPassesThroughUpstreamErrorStatusAndBody() throws Exception {
+        String body = "<html>blocked by risk control</html>";
+
+        org.springframework.mock.web.MockHttpServletRequest request =
+                new org.springframework.mock.web.MockHttpServletRequest("GET", "/p/1@42");
+        org.springframework.mock.web.MockHttpServletResponse response =
+                new org.springframework.mock.web.MockHttpServletResponse();
+        service.downloadStraight(stubUpstream(412, body), request, response, java.util.Map.of());
+
+        assertThat(response.getStatus()).isEqualTo(412);
+        assertThat(response.getContentAsString()).isEqualTo(body);
+    }
+
+    /** 正常 2xx 路径回归护栏:状态码、响应头、正文照旧透传。 */
+    @Test
+    void downloadStraightStreamsSuccessResponse() throws Exception {
+        String body = "0123456789abcdef";
+
+        org.springframework.mock.web.MockHttpServletRequest request =
+                new org.springframework.mock.web.MockHttpServletRequest("GET", "/p/1@42");
+        org.springframework.mock.web.MockHttpServletResponse response =
+                new org.springframework.mock.web.MockHttpServletResponse();
+        service.downloadStraight(stubUpstream(206, body), request, response, java.util.Map.of());
+
+        assertThat(response.getStatus()).isEqualTo(206);
+        assertThat(response.getContentAsString()).isEqualTo(body);
+        assertThat(response.getHeader("Content-Type")).isEqualTo("text/html");
+    }
+
+    // ---------- 服务端自取回源地址(UC/百度/夸克等 proxy 驱动) ----------
+
+    /** 线上(4567 docker):播放器从宿主机 127.0.0.1 连入,旧实现沿用请求 host+externalPort(ALIST_PORT=5344,
+     *  宿主映射端口)拼出 127.0.0.1:5344 —— 容器内无人监听(AList 听 5244)→ Connection refused,
+     *  UC/百度/夸克全灭;externalPort 只对客户端直连有效,服务端自取必须打 internalPort。 */
+    @Test
+    void localProxyUrlTargetsInternalPortForServerSideFetch() {
+        AListLocalService aListLocalService = mock(AListLocalService.class);
+        when(aListLocalService.getInternalPort()).thenReturn(5244);
+        when(aListLocalService.getExternalPort()).thenReturn(5344);
+        ProxyService proxyService = new ProxyService(null, playUrlRepository, null, null, aListLocalService, null);
+        Site localSite = site();
+        localSite.setUrl("http://localhost:5244");
+
+        String url = proxyService.buildAListProxyUrl(localSite,
+                "/追剧/.sources/醒来 [dbid-1]-补2/09.mkv", "abc=:0");
+
+        assertThat(url)
+                .startsWith("http://localhost:5244/p/%E8%BF%BD%E5%89%A7/.sources/"
+                        + "%E9%86%92%E6%9D%A5%20%5Bdbid-1%5D-%E8%A1%A52/09.mkv?sign=")
+                .endsWith("abc=:0")
+                .doesNotContain("5344");
+    }
 }

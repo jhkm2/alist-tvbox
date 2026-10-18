@@ -1,6 +1,8 @@
 package cn.har01d.alist_tvbox.live.service;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.model.Filter;
+import cn.har01d.alist_tvbox.model.FilterValue;
 import cn.har01d.alist_tvbox.service.SubscriptionService;
 import cn.har01d.alist_tvbox.tvbox.Category;
 import cn.har01d.alist_tvbox.tvbox.CategoryList;
@@ -38,7 +40,7 @@ public class LiveService {
     private final SubscriptionService subscriptionService;
     private final AppProperties appProperties;
 
-    public LiveService(HuyaService huyaService, DouyuService douyuService, BilibiliService bilibiliService, CcService ccService, KuaishouService kuaishouService, DouyinService douyinService, TwitchService twitchService, SoopService soopService, LiveFollowService liveFollowService, SubscriptionService subscriptionService, AppProperties appProperties) {
+    public LiveService(HuyaService huyaService, DouyuService douyuService, BilibiliService bilibiliService, CcService ccService, KuaishouService kuaishouService, DouyinService douyinService, TwitchService twitchService, SoopService soopService, AcfunService acfunService, InkeService inkeService, SixRoomService sixRoomService, KugouLiveService kugouLiveService, LookLiveService lookLiveService, YyService yyService, LiveFollowService liveFollowService, SubscriptionService subscriptionService, AppProperties appProperties) {
         this.huyaService = huyaService;
         platforms.add(huyaService);
         platforms.add(douyuService);
@@ -46,8 +48,14 @@ public class LiveService {
         platforms.add(ccService);
         platforms.add(kuaishouService);
         platforms.add(douyinService);
+        platforms.add(kugouLiveService);
+        platforms.add(acfunService);
+        platforms.add(inkeService);
+        platforms.add(sixRoomService);
+        platforms.add(yyService);
         platforms.add(twitchService);
         platforms.add(soopService);
+        platforms.add(lookLiveService);
         this.liveFollowService = liveFollowService;
         this.subscriptionService = subscriptionService;
         this.appProperties = appProperties;
@@ -71,7 +79,10 @@ public class LiveService {
         followCategory.setType_name("关注");
         followCategory.setType_flag(0);
         list.add(followCategory);
-        for (LivePlatform platform : platforms) {
+        for (LivePlatform platform : orderedPlatforms()) {
+            if (isHidden(platform)) {
+                continue;
+            }
             Category category = new Category();
             category.setType_id(platform.getType());
             category.setType_name(platform.getName());
@@ -81,8 +92,44 @@ public class LiveService {
         result.setCategories(list);
         result.setTotal(result.getCategories().size());
         result.setLimit(result.getCategories().size());
+        // "关注"分类追加平台筛选:值复用平台 type,list 端点按 platform 参数过滤
+        List<FilterValue> values = new ArrayList<>();
+        values.add(new FilterValue("全部", ""));
+        for (LivePlatform platform : orderedPlatforms()) {
+            if (isHidden(platform)) {
+                continue;
+            }
+            values.add(new FilterValue(platform.getName(), platform.getType()));
+        }
+        result.getFilters().put(LiveFollowService.CATEGORY_ID, List.of(new Filter("platform", "平台", values)));
 
         log.debug("category result: {}", result);
+        return result;
+    }
+
+    /** web 管理端配置的隐藏平台(live_hidden_platforms):不进分类/聚合搜索/关注筛选,detail 保留供已关注房间直达。 */
+    private boolean isHidden(LivePlatform platform) {
+        List<String> hidden = appProperties.getLiveHiddenPlatforms();
+        String type = platform.getType();
+        // 不可变 List.of 对 null 查询会抛 NPE,mock 场景 getType() 可能为 null
+        return hidden != null && type != null && hidden.contains(type);
+    }
+
+    /** 展示顺序(live_platform_order):在册平台按配置序在前,未列入的新平台按注册序追加。 */
+    public List<LivePlatform> orderedPlatforms() {
+        List<String> order = appProperties.getLivePlatformOrder();
+        if (order == null || order.isEmpty()) {
+            return platforms;
+        }
+        List<LivePlatform> result = new ArrayList<>();
+        for (String type : order) {
+            platforms.stream().filter(p -> type.equals(p.getType())).findFirst().ifPresent(result::add);
+        }
+        for (LivePlatform platform : platforms) {
+            if (result.stream().noneMatch(p -> p.getType().equals(platform.getType()))) {
+                result.add(platform);
+            }
+        }
         return result;
     }
 
@@ -92,6 +139,9 @@ public class LiveService {
             String[] parts = id.split("-");
             for (LivePlatform platform : platforms) {
                 if (platform.getType().equals(parts[0])) {
+                    if (isHidden(platform)) {
+                        return result;
+                    }
                     if (HOT_CATEGORY_ID.equals(parts[1])) {
                         return hotRooms(platform);
                     }
@@ -108,7 +158,7 @@ public class LiveService {
             }
 
             for (LivePlatform platform : platforms) {
-                if (platform.getType().equals(id)) {
+                if (platform.getType().equals(id) && !isHidden(platform)) {
                     List<MovieDetail> list = new ArrayList<>();
                     if ("folder".equals(mode)) {
                         MovieDetail hot = new MovieDetail();
@@ -150,7 +200,7 @@ public class LiveService {
     private String getUrl(String path) {
         try {
             return ServletUriComponentsBuilder.fromCurrentRequest()
-                    .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                    .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                     .replacePath(path)
                     .replaceQuery(null)
                     .build()
@@ -176,7 +226,10 @@ public class LiveService {
     public MovieList search(String wd) throws IOException {
         MovieList result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
-        for (LivePlatform platform : platforms) {
+        for (LivePlatform platform : orderedPlatforms()) {
+            if (isHidden(platform)) {
+                continue;
+            }
             try {
                 MovieList platformResult = platform.search(wd);
                 if (platformResult != null) {

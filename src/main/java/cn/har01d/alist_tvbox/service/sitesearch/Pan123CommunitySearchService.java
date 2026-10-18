@@ -1,6 +1,8 @@
 package cn.har01d.alist_tvbox.service.sitesearch;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.dto.SiteCredentialCheckRequest;
+import cn.har01d.alist_tvbox.dto.SiteCredentialCheckResult;
 import cn.har01d.alist_tvbox.dto.tg.Message;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -10,14 +12,17 @@ import okhttp3.FormBody;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
+import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.apache.commons.lang3.StringUtils;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -46,6 +51,9 @@ import java.util.regex.Pattern;
  * 至多回复一次,后续隐藏帖跳过;回复成功后 1.2s 重取详情一次,py 同款)。登录墙帖子
  * (无权访问文案)静默跳过。Cookie 不配不关源 —— 匿名可搜可提取非隐藏帖,只是隐藏帖
  * 跳过(与 123臻藏的「正文默认全隐藏」不同)。
+ *
+ * <p><b>每日签到</b>:配置 Cookie 时定时 POST {@code /?my-sign.htm}(签到得经验/金币),
+ * 同日幂等,详见 {@link #dailyCheckin()}。
  */
 @Slf4j
 @Service
@@ -70,11 +78,10 @@ public class Pan123CommunitySearchService {
     private static final List<String> REPLY_TEMPLATES = List.of(
             "感谢楼主分享！", "这个资源太棒了！", "已收藏，谢谢！", "不错的资源，支持一下",
             "楼主辛苦了！", "内容很有用，感谢分享");
+    // 只留 123 族:normalizeShare 只认 123 系 share key,quark/uc/ali 等域名候选 100% 被丢弃(死配置误导维护)
     private static final List<String> PAN_DOMAINS = List.of(
             "123pan.com", "123pan.cn", "share.123pan.cn", "123684.com", "123865.com",
-            "123912.com", "123592.com", "pan.quark.cn", "drive.uc.cn", "alipan.com",
-            "aliyundrive.com", "pan.aliyun.com", "pan.baidu.com", "115.com", "anxia.com",
-            "cloud.189.cn", "pan.xunlei.com", "yun.139.com", "mcloud.139.com", "mypikpak.com");
+            "123912.com", "123592.com");
     private static final Pattern THREAD_ID = Pattern.compile("thread-(\\d+)");
     private static final Pattern SHARE_123 = Pattern.compile(
             "(?:https?://)?(?:www\\.)?(?:(?:[\\w-]+\\.)?share\\.123pan\\.cn|123\\w{3}\\.com|123pan\\.(?:com|cn))/(?:s|123pan)/[^\\s\"'<>]+",
@@ -99,6 +106,7 @@ public class Pan123CommunitySearchService {
     private volatile String activeHost;
     /** 站点回复限速时间戳(实例级,跨搜索生效)。 */
     private volatile long lastReplyAt;
+    private volatile String lastCheckinDay = "";
 
     public Pan123CommunitySearchService(SettingRepository settingRepository, AppProperties appProperties,
                                         ObjectMapper objectMapper) {
@@ -117,7 +125,7 @@ public class Pan123CommunitySearchService {
         String host = activeHost();
         String cookie = SiteSearchSupport.setting(settingRepository, COOKIE_SETTING).trim();
         long deadline = System.currentTimeMillis()
-                + appProperties.getSubscription().getPan123communityTimeoutSeconds() * 1000L;
+                + Math.max(5, appProperties.getSubscription().getPan123communityTimeoutSeconds()) * 1000L;
         try {
             List<Card> cards = parseSearchResults(getJson(host, searchUrl(host, keyword.trim()), cookie));
             List<Message> result = new ArrayList<>();
@@ -158,12 +166,58 @@ public class Pan123CommunitySearchService {
             log.info("Pan123Community search {} get {} results", keyword, result.size());
             return result;
         } catch (Exception e) {
+            // 上抛而非吞掉空表:聚合层 searchAsync 捕获后记 SearchSourceThrottle 退避并返空;
+            // 吞掉则死站被 recordSuccess 清零连击,退避闸门对站点源永不生效
             log.warn("pan123community search [{}] failed: {}", keyword, e.getMessage());
-            return List.of();
+            throw e instanceof RuntimeException runtimeException ? runtimeException : new IllegalStateException(e);
         }
     }
 
     // ---------- 站点与请求 ----------
+
+    /**
+     * 每日定时签到(2026-09-13 抓包契约):POST {@code /?my-sign.htm} 空 body —— 本站
+     * rewrite 把路由放 query(与夸父的 {@code /my-sign.htm} 路径形态不同),XHR/Origin/
+     * Referer 头 + 社区 Cookie(须含 bbs_sid/bbs_token)。Xiuno 口径 {@code code=="0"}
+     * 为成功,message 带签到排名与经验/金币;「已签」文案同样记当日完成。Cookie 未配置
+     * 静默跳过;失败只记日志,不影响搜索主链路。
+     */
+    @Scheduled(cron = "0 11 6 * * *")
+    public void dailyCheckin() {
+        String cookie = SiteSearchSupport.setting(settingRepository, COOKIE_SETTING).trim();
+        if (cookie.isEmpty()) {
+            return;
+        }
+        String today = LocalDate.now().toString();
+        if (today.equals(lastCheckinDay)) {
+            return;
+        }
+        String host = activeHost();
+        try {
+            Resp resp = http(baseRequest(host, cookie, host + "/?my-sign.htm")
+                    .header("User-Agent", DESKTOP_UA)
+                    .header("Accept", "text/plain, */*; q=0.01")
+                    .header("Origin", host)
+                    .header("X-Requested-With", "XMLHttpRequest")
+                    .post(RequestBody.create(new byte[0]))
+                    .build());
+            JsonNode payload = SiteSearchSupport.parseJson(objectMapper,
+                    resp.code() == 200 ? resp.body() : "");
+            String message = payload.path("message").asText(payload.path("msg").asText(""));
+            if ("0".equals(payload.path("code").asText(""))) {
+                lastCheckinDay = today;
+                log.info("123社区每日签到完成:{}", cleanText(message));
+            } else if (SiteSearchSupport.alreadyCheckedIn(message)) {
+                lastCheckinDay = today;
+                log.debug("pan123community checkin already done today: {}", cleanText(message));
+            } else {
+                log.debug("pan123community checkin failed: code={} msg={}",
+                        payload.path("code").asText(""), cleanText(message));
+            }
+        } catch (Exception e) {
+            log.debug("pan123community checkin failed: {}", e.getMessage());
+        }
+    }
 
     /** 双站探活选站(2xx~3xx 即通,py _pick_site);Setting 覆盖则直接用;结果进程内缓存。 */
     String activeHost() {
@@ -250,6 +304,41 @@ public class Pan123CommunitySearchService {
             Thread.sleep(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    // ---------- Cookie 有效性检查(网页设置页) ----------
+
+    /**
+     * Cookie 有效性检查(只读):GET {@code /?user.htm} 个人中心 —— 匿名页只有
+     * {@code user-login} 链接,登录页才有 {@code user-logout}(Xiuno 头部口径,
+     * 2026-09-20 实测)。校验请求参数里的 Cookie(表单当前值),不动任何 Setting。
+     */
+    public SiteCredentialCheckResult checkCredential(SiteCredentialCheckRequest request) {
+        String cookie = StringUtils.trimToEmpty(request.cookie());
+        if (cookie.isEmpty()) {
+            return new SiteCredentialCheckResult("pan123community", false, "未填写 Cookie");
+        }
+        String host = SiteSearchSupport.normalizeHost(StringUtils.defaultString(request.host()), "");
+        if (host.isEmpty()) {
+            host = activeHost();
+        }
+        try {
+            Resp resp = http(baseRequest(host, cookie, host + "/?user.htm")
+                    .header("User-Agent", DESKTOP_UA)
+                    .get().build());
+            String body = resp.code() == 200 ? StringUtils.defaultString(resp.body()) : "";
+            if (body.contains("user-logout")) {
+                return new SiteCredentialCheckResult("pan123community", true, "Cookie 有效(登录态正常)");
+            }
+            if (body.contains("user-login")) {
+                return new SiteCredentialCheckResult("pan123community", false, "Cookie 已失效(站点判定未登录)");
+            }
+            return new SiteCredentialCheckResult("pan123community", false,
+                    "无法识别登录态(HTTP " + resp.code() + ")");
+        } catch (Exception e) {
+            log.debug("pan123community credential check failed: {}", e.getMessage());
+            return new SiteCredentialCheckResult("pan123community", false, "站点不可达(" + e.getMessage() + ")");
         }
     }
 

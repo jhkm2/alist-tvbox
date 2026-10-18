@@ -26,7 +26,7 @@ class MediaSubscriptionResolveLinkTest {
             Mockito.mock(MediaSubscriptionRepository.class),
             Mockito.mock(MediaSubscriptionResourceRepository.class),
             null, null, null, null, null, null, null, null, null, null, null, null,
-            new AppProperties(), new ObjectMapper(), null, null);
+            new AppProperties(), new ObjectMapper(), null, null, null);
 
     // ---------- 白名单判定 ----------
 
@@ -66,6 +66,18 @@ class MediaSubscriptionResolveLinkTest {
         assertEquals("douban", result.get("provider"));
         assertEquals("26794407", result.get("id"));
         assertEquals(26794407, result.get("doubanId"));
+    }
+
+    @Test
+    void tmdbMovieLinkResolvesWithNamespacedId() {
+        // 电影链接:metaId 带 movie: 前缀(tv/movie 两个命名空间);tv 链接保持裸 id
+        Map<String, Object> movie = service.resolveMetaLink("https://www.themoviedb.org/movie/438631/dune-part-two");
+        assertEquals("tmdb", movie.get("provider"));
+        assertEquals("movie:438631", movie.get("id"));
+        Map<String, Object> tv = service.resolveMetaLink("https://www.themoviedb.org/tv/1396/season/5");
+        assertEquals("tmdb", tv.get("provider"));
+        assertEquals("1396", tv.get("id"));
+        assertEquals(5, tv.get("season"));
     }
 
     @Test

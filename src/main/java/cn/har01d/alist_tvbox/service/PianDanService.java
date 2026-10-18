@@ -39,14 +39,21 @@ import java.util.TreeMap;
 @Service
 public class PianDanService {
     public static final String DOUBAN_PREFIX = "douban:";
+    public static final String DOUBAN_SUBJECT_PREFIX = "db:";
     public static final String TMDB_PREFIX = "tmdb:";
     private static final String TMDB_API_PATH = "/3";
     private static final String TMDB_IMAGE = "https://image.tmdb.org/t/p/w500";
 
     /** 豆瓣片单条目 vod_id(s:{标题}[@{年份}]):年份内嵌让详情/订阅绑定时能消歧同名翻拍;
-     *  片单条目载荷以 | 分段,vod_id 自身不能含 |。 */
+     *  片单条目载荷以 | 分段,vod_id 自身不能含 |。仅用于无豆瓣 id 的条目兜底。 */
     public static String subjectId(String name, Integer year) {
         return year == null ? "s:" + name : "s:" + name + "@" + year;
+    }
+
+    /** 豆瓣 subject id 条目 vod_id(db:{纯数字}):id 独立成类型不嵌标题 —— 标题里的 &/#/空格
+     *  会让爬虫端裸拼的 GET 参数被截断,纯数字 id 从根上免疫;标题由详情端按 id 解析。 */
+    public static String doubanSubjectId(int doubanId) {
+        return DOUBAN_SUBJECT_PREFIX + doubanId;
     }
 
     /** s:{标题}[@{年份}] → (标题, 年份?);无年份后缀时 year 为 null。 */
@@ -133,7 +140,9 @@ public class PianDanService {
     }
 
     /** 片单追更分类:排除电影类目(追更只对剧集/综艺的集数有意义);lite 榜单、趋势、动漫筛选里的电影选项一并隐藏。
-     * 电视端 csp_PianDan 导航仍走 category() 全量,电影分类在电视浏览场景是正当用途。 */
+     * 电视端 csp_PianDan 导航仍走 category() 全量,电影分类在电视浏览场景是正当用途。
+     * (2026-09-29 曾开放后回退:电影文件名多无集号,集源行只收有集号的文件,订阅停在 0/1 不可播;
+     * 电影继续走「稍后再看」。搜索入口的电影订阅误绑修复不受影响,保留。) */
     public CategoryList subscriptionCategory() {
         CategoryList result = category();
         result.getCategories().removeIf(category -> movieCategoryId(category.getType_id()));
@@ -174,6 +183,7 @@ public class PianDanService {
         }
         douban.getFilters().forEach((key, value) -> result.getFilters().put(DOUBAN_PREFIX + key, value));
         addDoubanHotFilters(result);
+        addDoubanCategoryFilters(result);
 
         addTmdbCategory(result, "trending", "TMDB趋势");
         addTmdbCategory(result, "movie_popular", "TMDB热门电影");
@@ -205,10 +215,12 @@ public class PianDanService {
         addDoubanCategory(result, "category", "分类");
         addDoubanCategory(result, "billboard", "榜单");
         keepDoubanCategories(result, douban, Set.of("local"));
-        result.getFilters().put(DOUBAN_PREFIX + "category", List.of(
-                filter("category", "分类", values(
+        result.getFilters().put(DOUBAN_PREFIX + "category", concatFilters(
+                List.of(filter("category", "分类", values(
                         "国产剧", "tv_domestic", "欧美剧", "tv_american", "韩剧", "tv_korean",
-                        "日剧", "tv_japanese", "动漫", "tv_animation", "综艺", "tv_variety_show"))));
+                        "日剧", "tv_japanese", "动漫", "tv_animation", "综艺", "tv_variety_show"))),
+                // 分类单选后的条件筛选:切到具体类目后可再叠地区/题材/年代(题材选「动画」与动漫类目重复词会被去重)
+                doubanConditionFilters(doubanTvGenreValues())));
         result.getFilters().put(DOUBAN_PREFIX + "billboard", List.of(
                 filter("billboard", "榜单", values(
                         "电影Top250", "movie_top250", "实时热门电影", "movie_real_time_hotest",
@@ -250,16 +262,85 @@ public class PianDanService {
 
     /** 豆瓣热门剧集/电影的地区筛选:近期热播接口不支持地区,带地区时 TelegramService 改走 recommend(tags 单国家粒度)。 */
     private void addDoubanHotFilters(CategoryList result) {
-        List<Filter> filters = List.of(filter("region", "地区", doubanRegionValues()));
-        result.getFilters().put(DOUBAN_PREFIX + "hot_tv", filters);
-        result.getFilters().put(DOUBAN_PREFIX + "hot_movie", filters);
+        result.getFilters().put(DOUBAN_PREFIX + "hot_tv", doubanConditionFilters(doubanTvGenreValues()));
+        result.getFilters().put(DOUBAN_PREFIX + "hot_movie", doubanConditionFilters(doubanMovieGenreValues()));
+    }
+
+    /** 分类六类目(国产剧/欧美剧/韩剧/日剧/动漫/综艺)下发同套条件筛选:带任一筛选降级 recommend 条件选片。 */
+    private void addDoubanCategoryFilters(CategoryList result) {
+        for (String id : List.of("tv_domestic", "tv_american", "tv_korean", "tv_japanese")) {
+            result.getFilters().put(DOUBAN_PREFIX + id, doubanConditionFilters(doubanTvGenreValues()));
+        }
+        // 动漫类目词表去掉「动画」题材(类目本身已是动画,叠加即重复词)
+        result.getFilters().put(DOUBAN_PREFIX + "tv_animation", doubanConditionFilters(doubanAnimationGenreValues()));
+        result.getFilters().put(DOUBAN_PREFIX + "tv_variety_show", doubanConditionFilters(doubanVarietyGenreValues()));
+    }
+
+    /** 豆瓣条件筛选面板(词表为 2026-09 官方 recommend_categories 实测):排序四态 T综合/U热度/R首播/S高分;
+     *  年代单年+年代段词(范围式 2022-2024 不支持,不收录)。 */
+    private List<Filter> doubanConditionFilters(List<FilterValue> genres) {
+        return List.of(
+                filter("region", "地区", doubanRegionValues()),
+                filter("genre", "题材", genres),
+                filter("year", "年代", doubanYearValues()),
+                filter("sort", "排序", doubanSortValues()));
     }
 
     private List<FilterValue> doubanRegionValues() {
         return values(
                 "全部地区", "", "中国大陆", "中国大陆", "日本", "日本", "韩国", "韩国",
-                "美国", "美国", "英国", "英国", "中国香港", "中国香港", "中国台湾", "中国台湾"
+                "美国", "美国", "英国", "英国", "中国香港", "中国香港", "中国台湾", "中国台湾",
+                "泰国", "泰国", "法国", "法国", "德国", "德国", "印度", "印度", "俄罗斯", "俄罗斯"
         );
+    }
+
+    private List<FilterValue> doubanYearValues() {
+        List<FilterValue> values = new ArrayList<>();
+        values.add(new FilterValue("全部年代", ""));
+        int year = LocalDate.now().getYear();
+        for (int i = 0; i < 20; ++i) {
+            String value = String.valueOf(year - i);
+            values.add(new FilterValue(value, value));
+        }
+        values.add(new FilterValue("2020年代", "2020年代"));
+        values.add(new FilterValue("2010年代", "2010年代"));
+        values.add(new FilterValue("2000年代", "2000年代"));
+        return values;
+    }
+
+    private List<FilterValue> doubanSortValues() {
+        return values("近期热度", "U", "高分优先", "S", "首播时间", "R", "综合排序", "T");
+    }
+
+    private List<FilterValue> doubanTvGenreValues() {
+        return values(
+                "全部题材", "", "喜剧", "喜剧", "爱情", "爱情", "悬疑", "悬疑", "动画", "动画",
+                "武侠", "武侠", "古装", "古装", "家庭", "家庭", "犯罪", "犯罪", "科幻", "科幻",
+                "恐怖", "恐怖", "历史", "历史", "战争", "战争", "动作", "动作", "冒险", "冒险",
+                "传记", "传记", "剧情", "剧情", "奇幻", "奇幻", "惊悚", "惊悚", "灾难", "灾难",
+                "歌舞", "歌舞", "音乐", "音乐");
+    }
+
+    private List<FilterValue> doubanAnimationGenreValues() {
+        return values(
+                "全部题材", "", "喜剧", "喜剧", "爱情", "爱情", "悬疑", "悬疑",
+                "武侠", "武侠", "古装", "古装", "家庭", "家庭", "犯罪", "犯罪", "科幻", "科幻",
+                "恐怖", "恐怖", "历史", "历史", "战争", "战争", "动作", "动作", "冒险", "冒险",
+                "传记", "传记", "剧情", "剧情", "奇幻", "奇幻", "惊悚", "惊悚", "灾难", "灾难",
+                "歌舞", "歌舞", "音乐", "音乐");
+    }
+
+    private List<FilterValue> doubanVarietyGenreValues() {
+        return values("全部题材", "", "真人秀", "真人秀", "脱口秀", "脱口秀", "音乐", "音乐", "歌舞", "歌舞");
+    }
+
+    private List<FilterValue> doubanMovieGenreValues() {
+        return values(
+                "全部题材", "", "喜剧", "喜剧", "爱情", "爱情", "动作", "动作", "科幻", "科幻",
+                "动画", "动画", "悬疑", "悬疑", "犯罪", "犯罪", "惊悚", "惊悚", "冒险", "冒险",
+                "音乐", "音乐", "历史", "历史", "奇幻", "奇幻", "恐怖", "恐怖", "战争", "战争",
+                "传记", "传记", "歌舞", "歌舞", "武侠", "武侠", "灾难", "灾难", "西部", "西部",
+                "纪录片", "纪录片", "短片", "短片");
     }
 
     private void keepDoubanCategories(CategoryList result, CategoryList douban, Set<String> ids) {
@@ -475,6 +556,80 @@ public class PianDanService {
         }
     }
 
+    /** 豆瓣 subject id 条目(db:)详情:本地豆瓣库未收的榜单新片按 id 在线解析 ——
+     *  rexxar tv 条目接口对电影 id 404,先 tv 再 movie 两跳;命中 5min 短缓存,失败返回 null 由调用方兜底。 */
+    public MovieDetail doubanSubjectDetail(int doubanId) {
+        String cacheKey = DOUBAN_SUBJECT_PREFIX + doubanId;
+        MovieDetail cached = detailCache.getIfPresent(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        MovieDetail detail = fetchDoubanSubject("tv", doubanId);
+        if (detail == null) {
+            detail = fetchDoubanSubject("movie", doubanId);
+        }
+        if (detail != null) {
+            detailCache.put(cacheKey, detail);
+        }
+        return detail;
+    }
+
+    private MovieDetail fetchDoubanSubject(String mediaType, int doubanId) {
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.set(HttpHeaders.REFERER, "https://m.douban.com/");
+            headers.set(HttpHeaders.USER_AGENT, cn.har01d.alist_tvbox.util.Utils.getUserAgent());
+            var response = restTemplate.exchange(URI.create("https://m.douban.com/rexxar/api/v2/" + mediaType + "/" + doubanId),
+                    HttpMethod.GET, new HttpEntity<>(null, headers), JsonNode.class);
+            JsonNode body = response.getBody();
+            if (body == null || !body.hasNonNull("title")) {
+                return null;
+            }
+            MovieDetail detail = new MovieDetail();
+            detail.setVod_id(doubanSubjectId(doubanId));
+            detail.setVod_name(body.get("title").asText());
+            detail.setVod_pic(body.path("pic").path("large").asText(body.path("pic").path("normal").asText("")));
+            String year = body.path("year").asText("");
+            if (year.matches("\\d{4}")) {
+                detail.setVod_year(year);
+            }
+            double rating = body.path("rating").path("value").asDouble(0);
+            if (rating > 0) {
+                detail.setVod_remarks(String.valueOf(rating));
+            }
+            detail.setType_name(joinNames(body.path("genres"), 3, " / "));
+            detail.setVod_area(joinNames(body.path("countries"), 2, " / "));
+            detail.setVod_lang(joinNames(body.path("languages"), 2, " / "));
+            detail.setVod_director(joinNames(body.path("directors"), 3, " / "));
+            detail.setVod_actor(joinNames(body.path("actors"), 5, " / "));
+            String intro = body.path("intro").asText("");
+            if (StringUtils.isNotBlank(intro)) {
+                detail.setVod_content(intro);
+            }
+            return detail;
+        } catch (RestClientException e) {
+            log.debug("load douban subject {} failed: {}", mediaType + '/' + doubanId, e.getMessage());
+            return null;
+        }
+    }
+
+    private static String joinNames(JsonNode array, int limit, String separator) {
+        if (!array.isArray()) {
+            return null;
+        }
+        List<String> names = new ArrayList<>();
+        for (JsonNode node : array) {
+            String name = node.path("name").asText(node.asText(""));
+            if (StringUtils.isNotBlank(name)) {
+                names.add(name);
+            }
+            if (names.size() >= limit) {
+                break;
+            }
+        }
+        return names.isEmpty() ? null : String.join(separator, names);
+    }
+
     public MovieList list(String type, String ac, int page, int size, Map<String, String> filters) {
         int safePage = Math.max(1, page);
         int safeSize = Math.max(1, size);
@@ -483,7 +638,7 @@ public class PianDanService {
                     resolveDoubanType(type.substring(DOUBAN_PREFIX.length()), filters),
                     ac,
                     filters.get("sort"),
-                    parseYear(filters.get("year")),
+                    filters.get("year"),
                     filters.get("genre"),
                     filters.get("region"),
                     safePage,
@@ -1070,6 +1225,12 @@ public class PianDanService {
         return new Filter(key, name, values);
     }
 
+    private static List<Filter> concatFilters(List<Filter> first, List<Filter> second) {
+        List<Filter> filters = new ArrayList<>(first);
+        filters.addAll(second);
+        return filters;
+    }
+
     private List<FilterValue> values(String... pairs) {
         List<FilterValue> values = new ArrayList<>();
         for (int i = 0; i < pairs.length; i += 2) {
@@ -1087,13 +1248,6 @@ public class PianDanService {
         return category;
     }
 
-    private Integer parseYear(String year) {
-        try {
-            return StringUtils.isBlank(year) ? null : Integer.valueOf(year);
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
 
     private String valueOrDefault(Map<String, String> values, String key, String defaultValue) {
         return StringUtils.defaultIfBlank(values.get(key), defaultValue);

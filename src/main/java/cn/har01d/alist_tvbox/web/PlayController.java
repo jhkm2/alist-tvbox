@@ -9,6 +9,7 @@ import cn.har01d.alist_tvbox.service.PianDanSubscriptionService;
 import cn.har01d.alist_tvbox.service.ProxyService;
 import cn.har01d.alist_tvbox.service.SubscriptionService;
 import cn.har01d.alist_tvbox.service.TvBoxService;
+import cn.har01d.alist_tvbox.service.WatchlistService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
@@ -36,6 +37,7 @@ public class PlayController {
     private final MediaSubscriptionService mediaSubscriptionService;
     private final PianDanSubscriptionService pianDanSubscriptionService;
     private final AccountAccessGuard accountAccessGuard;
+    private final WatchlistService watchlistService;
 
     public PlayController(TvBoxService tvBoxService,
                           BiliBiliService biliBiliService,
@@ -43,7 +45,8 @@ public class PlayController {
                           ProxyService proxyService,
                           MediaSubscriptionService mediaSubscriptionService,
                           PianDanSubscriptionService pianDanSubscriptionService,
-                          AccountAccessGuard accountAccessGuard) {
+                          AccountAccessGuard accountAccessGuard,
+                          WatchlistService watchlistService) {
         this.tvBoxService = tvBoxService;
         this.biliBiliService = biliBiliService;
         this.subscriptionService = subscriptionService;
@@ -51,6 +54,7 @@ public class PlayController {
         this.mediaSubscriptionService = mediaSubscriptionService;
         this.pianDanSubscriptionService = pianDanSubscriptionService;
         this.accountAccessGuard = accountAccessGuard;
+        this.watchlistService = watchlistService;
     }
 
     @RequestMapping(value = "/p/{token}/{id}")
@@ -92,8 +96,37 @@ public class PlayController {
         // com.qingsong.yingmi      影迷
         log.debug("get play url - site: {}  path: {}  id: {}  bvid: {}  type: {}  client: {}", site, path, id, bvid, type, client);
 
+        // 版本错位兜底:旧 spider jar 不含新动作前缀的拦截,点击动作条目会走默认播放路径把条目 id 当 bvid
+        // 发上来(误入 getPlayUrl 拆出 avid=biliwatch,上游 -400 风控文案误导排障);识别动作前缀归位到 id 分发
+        if (StringUtils.isBlank(id) && BiliBiliService.isActionPlayId(bvid)) {
+            id = bvid;
+            bvid = null;
+        }
+
         if (StringUtils.isNotBlank(bvid)) {
             return biliBiliService.getPlayUrl(bvid, dash, client);
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith(BiliBiliService.BILI_STAT_PLAY_PREFIX)) {
+            // B站详情「操作」线路首条「互动状态」:零副作用占位(防内核切线路自动触发第 1 条误执行动作),msg 回显互动状态
+            return Map.of("msg", biliBiliService.getActionStatusText(
+                    id.substring(BiliBiliService.BILI_STAT_PLAY_PREFIX.length())));
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith(BiliBiliService.BILI_LIKE_PLAY_PREFIX)) {
+            return biliActionMsg(id, BiliBiliService.BILI_LIKE_PLAY_PREFIX, "like");
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith(BiliBiliService.BILI_COIN_PLAY_PREFIX)) {
+            return biliActionMsg(id, BiliBiliService.BILI_COIN_PLAY_PREFIX, "coin");
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith(BiliBiliService.BILI_FAV_PLAY_PREFIX)) {
+            return biliActionMsg(id, BiliBiliService.BILI_FAV_PLAY_PREFIX, "favorite");
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith(BiliBiliService.BILI_WATCH_PLAY_PREFIX)) {
+            return biliActionMsg(id, BiliBiliService.BILI_WATCH_PLAY_PREFIX, "watchlater");
         }
 
         if (StringUtils.isNotBlank(id) && id.startsWith("msubadd-")) {
@@ -114,6 +147,20 @@ public class PlayController {
             // 片单条目「媒体信息」:msg 通道返回条目元数据,无副作用(TMDB 现拉详情,豆瓣条目只有标题)
             int uid = mediaSubscriptionService.resolveUid(token);
             return infoPianDan(uid, id.substring(MediaSubscriptionService.INFO_PLAY_PREFIX.length()));
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith("watchadd-")) {
+            // 片单条目「加入稍后再看」(watchadd-{vodId}|{剧名}):载荷同 msubadd-,msg 通道回执
+            int uid = mediaSubscriptionService.resolveUid(token);
+            return Map.of("msg", watchlistService.add(uid,
+                    id.substring(MediaSubscriptionService.WATCH_ADD_PLAY_PREFIX.length())).msg());
+        }
+
+        if (StringUtils.isNotBlank(id) && id.startsWith("watchdel-")) {
+            // 片单条目「移出稍后再看」(watchdel- 同载荷):按 vodId 精确删,msg 通道回执
+            int uid = mediaSubscriptionService.resolveUid(token);
+            return Map.of("msg", watchlistService.remove(uid,
+                    id.substring(MediaSubscriptionService.WATCH_DEL_PLAY_PREFIX.length())).msg());
         }
 
         if (StringUtils.isNotBlank(id) && id.startsWith("msubstat-")) {
@@ -212,6 +259,16 @@ public class PlayController {
 //        }
 
         return result;
+    }
+
+    /** B站详情「操作」线路「点赞/投币/收藏」:执行回执走 msg 通道(TVBox 端 Toast 可见);
+     *  失败原因(未登录/投满上限/上游错误)同样 msg 回执,不炸 400 —— 播放器把 msg 显示为提示。 */
+    private Object biliActionMsg(String id, String prefix, String action) {
+        try {
+            return Map.of("msg", biliBiliService.runActionText(id.substring(prefix.length()), action));
+        } catch (BadRequestException e) {
+            return Map.of("msg", e.getMessage());
+        }
     }
 
     /** 片单条目「媒体信息」:纯占位条目(防播放器内核进详情自动触发第一集误订阅),静态响应——

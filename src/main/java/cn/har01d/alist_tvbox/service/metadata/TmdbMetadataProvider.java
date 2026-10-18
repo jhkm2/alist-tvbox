@@ -32,6 +32,9 @@ import java.util.List;
 @Component
 public class TmdbMetadataProvider implements MetadataProvider {
     public static final String NAME = "tmdb";
+    /** 电影条目 metaId 前缀:TMDB tv/movie id 是两个独立命名空间,订阅绑电影必须带前缀区分
+     *  (裸 id 会被当剧集查 /3/tv/{id} 绑到无关条目)。 */
+    public static final String MOVIE_ID_PREFIX = "movie:";
     private static final ZoneId ZONE = ZoneId.of(Constants.ZONE_ID);
 
     private final TmdbEndpoint tmdbEndpoint;
@@ -142,6 +145,9 @@ public class TmdbMetadataProvider implements MetadataProvider {
     }
 
     private MetadataDetails fetchDetails(String id, int season) {
+        if (id.startsWith(MOVIE_ID_PREFIX)) {
+            return fetchMovieDetails(id);
+        }
         MetadataDetails details = new MetadataDetails();
         details.setProvider(NAME);
         details.setId(id);
@@ -315,10 +321,148 @@ public class TmdbMetadataProvider implements MetadataProvider {
             if (playScheduleBridge != null && !biliClocked) {
                 playScheduleBridge.refine(details); // 豆瓣桥接带出播放源后校正爱优腾实际排播时刻;B站已校正则让位(与豆瓣链同规)
             }
+            // 全剧绝对集号形态的剧级信号采纳:必须在 bangumi/B站桥接之后(见方法注释的翻倍坑)
+            adoptWholeShowSignals(details, tv, season);
         } catch (Exception e) {
             health.record(NAME, false);
             log.warn("tmdb details {} failed: {}", id, e.getMessage());
             return StringUtils.isBlank(details.getName()) ? null : details; // 空壳不缓存(detailsCache 对 null 不落位)
+        }
+        return details;
+    }
+
+    /**
+     * TMDB 电影详情(metaId 形态 {@code movie:{id}}):电影按 1 个资源位建模 —— 总集数恒 1,
+     * 已映(Released)=已播 1,收齐 1 个文件即与剧集 endedByCollectedAll 同路完结;
+     * 未映=已播 0 且上映日进 nextAirTime/upcoming(待上映电影进播放时间轴)。
+     * 分集导向的桥接(Bangumi/B站/平台排播)不参与,评分桥接照常补豆瓣互补分。
+     */
+    private MetadataDetails fetchMovieDetails(String metaId) {
+        String id = metaId.substring(MOVIE_ID_PREFIX.length());
+        MetadataDetails details = new MetadataDetails();
+        details.setProvider(NAME);
+        details.setId(metaId);
+        try {
+            JsonNode movie = get(tmdbEndpoint.apiHost() + "/3/movie/" + id
+                    + "?language=zh-CN&append_to_response=images");
+            if (movie == null) {
+                return details;
+            }
+            details.setName(movie.path("title").asText());
+            details.setOriginalName(movie.path("original_title").asText());
+            String releaseDate = movie.path("release_date").asText("");
+            details.setYear(yearOf(releaseDate));
+            details.setFirstAirDate(releaseDate);
+            details.setRating(ratingOf(movie.path("vote_average").asDouble(0)));
+            if (details.getRating() != null) {
+                details.setRatings(new java.util.LinkedHashMap<>(java.util.Map.of("tmdb", details.getRating())));
+            }
+            details.setExternalIds(new java.util.LinkedHashMap<>(java.util.Map.of("tmdb", id)));
+            List<String> genres = new ArrayList<>();
+            for (JsonNode genre : movie.path("genres")) {
+                String name = genre.path("name").asText();
+                if (StringUtils.isNotBlank(name)) {
+                    genres.add(name);
+                }
+            }
+            details.setGenres(genres);
+            String language = movie.path("original_language").asText("");
+            if (StringUtils.isNotBlank(language)) {
+                details.setLanguages(List.of(language));
+            }
+            String backdrop = movie.path("backdrop_path").asText("");
+            if (StringUtils.isNotBlank(backdrop)) {
+                details.setBackdrop(BACKDROP_BASE + backdrop);
+            }
+            List<String> backdrops = bestBackdropUrls(movie);
+            if (!backdrops.isEmpty()) {
+                details.setBackdrops(backdrops);
+                if (StringUtils.isBlank(details.getBackdrop())) {
+                    details.setBackdrop(backdrops.get(0));
+                }
+            }
+            String poster = movie.path("poster_path").asText("");
+            if (StringUtils.isNotBlank(poster)) {
+                details.setCover("https://media.themoviedb.org/t/p/w300_and_h450_bestv2" + poster);
+            }
+            details.setOverview(movie.path("overview").asText(""));
+            int runtime = movie.path("runtime").asInt(0);
+            if (runtime > 0) {
+                details.setRuntimeMinutes(runtime);
+            }
+            boolean released = "Released".equals(movie.path("status").asText());
+            details.setStatus(released ? MetadataDetails.STATUS_ENDED : MetadataDetails.STATUS_UNKNOWN);
+            details.setTotalEpisodes(1);
+            details.setAiredEpisodes(released ? 1 : 0);
+            LocalDate airDate = localDate(releaseDate);
+            if (!released && airDate != null) {
+                long airMoment = airDate.atTime(20, 0).atZone(ZONE).toInstant().toEpochMilli();
+                details.setNextAirTime(airMoment);
+                details.setUpcoming(List.of(new cn.har01d.alist_tvbox.dto.EpisodeAirDate(1, airMoment)));
+            }
+            // 别名(标题归属匹配素材:海外电影分享常用英文原名/其他译名)
+            JsonNode alt = get(tmdbEndpoint.apiHost() + "/3/movie/" + id + "/alternative_titles");
+            List<String> aliases = new ArrayList<>();
+            if (alt != null && alt.has("results")) {
+                for (JsonNode item : alt.get("results")) {
+                    String title = item.path("title").asText();
+                    if (StringUtils.isNotBlank(title)) {
+                        aliases.add(title);
+                    }
+                }
+            }
+            details.setAliases(aliases);
+            // 演职人员:cast=主演,crew=导演/编剧
+            JsonNode credits = get(tmdbEndpoint.apiHost() + "/3/movie/" + id + "/credits"
+                    + "?language=zh-CN");
+            if (credits != null) {
+                List<cn.har01d.alist_tvbox.dto.CastMember> cast = new ArrayList<>();
+                if (credits.has("cast") && credits.get("cast").isArray()) {
+                    for (JsonNode person : credits.get("cast")) {
+                        if (cast.size() >= 15) {
+                            break;
+                        }
+                        String name = person.path("name").asText();
+                        if (StringUtils.isBlank(name)) {
+                            continue;
+                        }
+                        String profile = person.path("profile_path").asText("");
+                        cast.add(new cn.har01d.alist_tvbox.dto.CastMember(name,
+                                person.path("character").asText(""),
+                                StringUtils.isNotBlank(profile)
+                                        ? "https://media.themoviedb.org/t/p/w185" + profile : null));
+                    }
+                }
+                details.setCast(cast);
+                List<String> directors = new ArrayList<>();
+                List<String> writers = new ArrayList<>();
+                if (credits.has("crew") && credits.get("crew").isArray()) {
+                    for (JsonNode person : credits.get("crew")) {
+                        String name = person.path("name").asText();
+                        if (StringUtils.isBlank(name)) {
+                            continue;
+                        }
+                        String job = person.path("job").asText("");
+                        if ("Director".equals(job) && directors.size() < 5) {
+                            directors.add(name);
+                        } else if ("Writer".equals(job) && writers.size() < 8) {
+                            writers.add(name);
+                        }
+                    }
+                }
+                details.setDirectors(directors.isEmpty() ? null : directors);
+                if (!writers.isEmpty()) {
+                    details.setWriters(writers);
+                }
+            }
+            health.record(NAME, true);
+            if (ratingBridge != null) {
+                ratingBridge.enrich(details, 1); // 补豆瓣评分与外链,失败自静默(电影无季,季参不参与)
+            }
+        } catch (Exception e) {
+            health.record(NAME, false);
+            log.warn("tmdb movie details {} failed: {}", id, e.getMessage());
+            return StringUtils.isBlank(details.getName()) ? null : details;
         }
         return details;
     }
@@ -398,6 +542,67 @@ public class TmdbMetadataProvider implements MetadataProvider {
         if (nextAir != null) {
             details.setNextAirTime(nextAir.atTime(20, 0).atZone(ZONE).toInstant().toEpochMilli());
         }
+    }
+
+    /**
+     * 全剧绝对集号形态(海贼王/柯南):季只是篇章,episode_number 跨季连续,season 1 订阅=全剧订阅。
+     * 判定:最近已播集的集号超出其所在季的注册集数 —— 分季编号剧的集号恒 ≤ 本季注册数
+     * (末日地堡 S3E8 ≤ 8 不触发),绝对编号剧的集号是全剧位置必然越过(海贼王 S23 注册 26 集,
+     * 已播 E1176)。命中后采纳剧级权威信号,只升不降:已播=最近已播集号、总数≥number_of_episodes、
+     * 下集排播不再按季过滤(下集在任何季都与 S1 同处一个连续集号空间)。
+     * <p>
+     * 不修的后果(线上 海贼王 sub48 卡 ENDED):next_episode_to_air 按季过滤丢弃 → nextAirTime 恒空,
+     * 已播/总数停在 bangumi 桥接的滞后登记值(1151/1155),本地集齐 1155 即被 endedByCollectedAll
+     * 误判完结,且重开条件「官方已播 > 本地」被滞后口径反向堵死(本地 1174 > 官方 1151)永不重开。
+     * <p>
+     * 必须在 bangumi/B站桥接之后执行:bangumi 桥接对已播是逐行累加,先抬已播会被翻倍。
+     */
+    static void adoptWholeShowSignals(MetadataDetails details, JsonNode tv, int season) {
+        if (season != 1) {
+            return; // 分季订阅走季口径 + seasonStartEpisode 对齐,剧级信号混入会冒领别季集号
+        }
+        JsonNode last = tv.path("last_episode_to_air");
+        int lastNumber = last.path("episode_number").asInt(0);
+        int ownCount = seasonEpisodeCount(tv, last.path("season_number").asInt(-1));
+        if (lastNumber <= 0 || ownCount <= 0 || lastNumber <= ownCount) {
+            return; // 分季编号剧(集号不出本季 1..K 空间)或季注册缺失:维持季口径
+        }
+        if (lastNumber > (details.getAiredEpisodes() == null ? 0 : details.getAiredEpisodes())) {
+            details.setAiredEpisodes(lastNumber);
+        }
+        int showTotal = tv.path("number_of_episodes").asInt(0);
+        if (showTotal > (details.getTotalEpisodes() == null ? 0 : details.getTotalEpisodes())) {
+            details.setTotalEpisodes(showTotal);
+        }
+        JsonNode next = tv.path("next_episode_to_air");
+        LocalDate airDate = next.isObject() ? localDate(next.path("air_date").asText()) : null;
+        if (airDate == null) {
+            return;
+        }
+        long airMoment = airDate.atTime(20, 0).atZone(ZONE).toInstant().toEpochMilli();
+        Long currentNext = details.getNextAirTime();
+        if (currentNext == null || airMoment < currentNext) {
+            details.setNextAirTime(airMoment);
+        }
+        int nextNumber = next.path("episode_number").asInt(0);
+        if (nextNumber > 0 && details.getUpcoming() != null && details.getUpcoming().size() < 60
+                && details.getUpcoming().stream().noneMatch(e -> e.getEpisode() == nextNumber)) {
+            List<cn.har01d.alist_tvbox.dto.EpisodeAirDate> upcoming = new ArrayList<>(details.getUpcoming());
+            upcoming.add(new cn.har01d.alist_tvbox.dto.EpisodeAirDate(nextNumber, airMoment));
+            details.setUpcoming(upcoming); // 排播行进时间轴;去重防与季内路径重复
+        }
+    }
+
+    private static int seasonEpisodeCount(JsonNode tv, int seasonNumber) {
+        if (seasonNumber < 0) {
+            return 0;
+        }
+        for (JsonNode s : tv.path("seasons")) {
+            if (s.path("season_number").asInt(-1) == seasonNumber) {
+                return s.path("episode_count").asInt(0);
+            }
+        }
+        return 0;
     }
 
     /** 外网 GET:失败上抛(调用方 catch 记 health/降级)—— 吞掉返回 null 会让熔断器永远打不开,

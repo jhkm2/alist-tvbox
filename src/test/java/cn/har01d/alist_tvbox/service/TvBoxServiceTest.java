@@ -120,8 +120,27 @@ class TvBoxServiceTest {
     }
 
     @Test
-    void getDetailRoutesHttpShareLinkToMountedPlaylist() {
-        // 播放同步回放:ids 为网盘分享链接 → 挂载后转成 "1$<path>/~playlist" 走 getPlaylist。
+    void fixHttpKeepsPlainSchemeForRawAListPortBehindTlsProxy() {
+        // 1.90.0 回归(线上夸克播放全灭):fixHttp 把 PowerList 的 localhost 直链改写为
+        // {scheme}://{域名}:5344,5344 是裸 AList 明文端口不在反代 TLS 覆盖内,
+        // 主请求经 NPM 带来的 X-Forwarded-Proto=https 只描述主端口,跨端口套用会拼出
+        // https://domain:5344 对明文端口 TLS 握手必死;此处必须维持 http
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/play");
+        request.setServerName("tvbox.example");
+        request.addHeader("X-Forwarded-Proto", "https");
+        org.springframework.web.context.request.RequestContextHolder
+                .setRequestAttributes(new ServletRequestAttributes(request));
+        when(aListLocalService.getExternalPort()).thenReturn(5344);
+        when(appProperties.isEnableHttps()).thenReturn(false);
+
+        String fixed = org.springframework.test.util.ReflectionTestUtils
+                .invokeMethod(tvBoxService, "fixHttp", "http://localhost:5244/d/quark/video.mkv");
+
+        assertThat(fixed).isEqualTo("http://tvbox.example:5344/d/quark/video.mkv");
+    }
+
+    @Test
+    void getDetailRoutesHttpShareLinkToMountedPlaylist() {        // 播放同步回放:ids 为网盘分享链接 → 挂载后转成 "1$<path>/~playlist" 走 getPlaylist。
         // 用 spy 桩掉递归的 getDetail,隔离 dfs/aListService,只验证路由与挂载。
         TvBoxService spied = spy(tvBoxService);
         String link = "https://pan.baidu.com/s/abc?pwd=HAO8";
@@ -323,6 +342,101 @@ class TvBoxServiceTest {
 
         cn.har01d.alist_tvbox.tvbox.MovieDetail md = result.getList().get(0);
         assertThat(md.getVod_name()).isEqualTo("百花杀");
+    }
+
+    // 同目录国语/粤语混排(如 01-4K国语.mp4/01-4K粤语.mp4)应拆成两条播放线路,
+    // vod_play_from=国语$$$粤语,各自集数连续;文件名顺序混排也不影响分组。
+    @Test
+    void getPlaylistSplitsMandarinAndCantoneseIntoSeparateLines() {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/play");
+        request.setScheme("http");
+        request.setServerName("127.0.0.1");
+        request.setServerPort(8080);
+        org.springframework.web.context.request.RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+
+        Site site = new Site();
+        site.setId(1);
+        site.setName("丫仙女");
+        String playlistPath = "/我的百度分享/死丨有D证 2026/~playlist";
+        String folderPath = "/我的百度分享/死丨有D证 2026";
+
+        FsDetail detail = new FsDetail();
+        detail.setName("死丨有D证 2026");
+
+        cn.har01d.alist_tvbox.model.FsResponse fsResponse = new cn.har01d.alist_tvbox.model.FsResponse();
+        java.util.List<cn.har01d.alist_tvbox.model.FsInfo> files = new java.util.ArrayList<>();
+        for (String name : new String[]{"01-4K国语.mp4", "01-4K粤语.mp4", "02-4K国语.mp4", "02-4K粤语.mp4"}) {
+            cn.har01d.alist_tvbox.model.FsInfo file = new cn.har01d.alist_tvbox.model.FsInfo();
+            file.setName(name);
+            file.setSize(496500000L);
+            files.add(file);
+        }
+        fsResponse.setFiles(files);
+
+        when(tenantService.valid(folderPath)).thenReturn(true);
+        when(aListService.getFile(site, folderPath)).thenReturn(detail);
+        when(aListService.listFiles(site, folderPath, 1, 0)).thenReturn(fsResponse);
+        when(proxyService.generatePath(site, playlistPath)).thenReturn(217130);
+        when(appProperties.getFormats()).thenReturn(Set.of("mp4"));
+        when(proxyService.generateProxyUrl(site, folderPath + "/01-4K国语.mp4")).thenReturn(217131);
+        when(proxyService.generateProxyUrl(site, folderPath + "/01-4K粤语.mp4")).thenReturn(217132);
+        when(proxyService.generateProxyUrl(site, folderPath + "/02-4K国语.mp4")).thenReturn(217133);
+        when(proxyService.generateProxyUrl(site, folderPath + "/02-4K粤语.mp4")).thenReturn(217134);
+
+        cn.har01d.alist_tvbox.tvbox.MovieList result = tvBoxService.getPlaylist("", site, playlistPath);
+
+        cn.har01d.alist_tvbox.tvbox.MovieDetail md = result.getList().get(0);
+        assertThat(md.getVod_play_from()).isEqualTo("国语$$$粤语");
+        String[] groups = md.getVod_play_url().split("\\$\\$\\$");
+        assertThat(groups).hasSize(2);
+        assertThat(groups[0]).contains("01-4K国语.mp4").contains("02-4K国语.mp4").doesNotContain("粤语");
+        assertThat(groups[1]).contains("01-4K粤语.mp4").contains("02-4K粤语.mp4").doesNotContain("国语");
+        // 每条线路内部集条目用 # 相连,URL 尾段 source 计数随线路递增
+        assertThat(groups[0]).contains("@0@0").contains("@0@1");
+        assertThat(groups[1]).contains("@1@0").contains("@1@1");
+    }
+
+    // 单语言目录不拆线:vod_play_from 仍是站点名、单条线路,与拆分功能上线前行为一致。
+    @Test
+    void getPlaylistKeepsSingleLineWhenOnlyOneAudioLanguage() {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/play");
+        request.setScheme("http");
+        request.setServerName("127.0.0.1");
+        request.setServerPort(8080);
+        org.springframework.web.context.request.RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+
+        Site site = new Site();
+        site.setId(1);
+        site.setName("丫仙女");
+        String playlistPath = "/我的百度分享/死丨有D证 2026/~playlist";
+        String folderPath = "/我的百度分享/死丨有D证 2026";
+
+        FsDetail detail = new FsDetail();
+        detail.setName("死丨有D证 2026");
+
+        cn.har01d.alist_tvbox.model.FsResponse fsResponse = new cn.har01d.alist_tvbox.model.FsResponse();
+        java.util.List<cn.har01d.alist_tvbox.model.FsInfo> files = new java.util.ArrayList<>();
+        for (String name : new String[]{"01-4K国语.mp4", "02-4K国语.mp4"}) {
+            cn.har01d.alist_tvbox.model.FsInfo file = new cn.har01d.alist_tvbox.model.FsInfo();
+            file.setName(name);
+            file.setSize(496500000L);
+            files.add(file);
+        }
+        fsResponse.setFiles(files);
+
+        when(tenantService.valid(folderPath)).thenReturn(true);
+        when(aListService.getFile(site, folderPath)).thenReturn(detail);
+        when(aListService.listFiles(site, folderPath, 1, 0)).thenReturn(fsResponse);
+        when(proxyService.generatePath(site, playlistPath)).thenReturn(217130);
+        when(appProperties.getFormats()).thenReturn(Set.of("mp4"));
+        when(proxyService.generateProxyUrl(site, folderPath + "/01-4K国语.mp4")).thenReturn(217131);
+        when(proxyService.generateProxyUrl(site, folderPath + "/02-4K国语.mp4")).thenReturn(217133);
+
+        cn.har01d.alist_tvbox.tvbox.MovieList result = tvBoxService.getPlaylist("", site, playlistPath);
+
+        cn.har01d.alist_tvbox.tvbox.MovieDetail md = result.getList().get(0);
+        assertThat(md.getVod_play_from()).isEqualTo("丫仙女");
+        assertThat(md.getVod_play_url()).doesNotContain("$$$");
     }
 
     @Test

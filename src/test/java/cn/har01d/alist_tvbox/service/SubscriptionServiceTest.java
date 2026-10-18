@@ -140,7 +140,8 @@ class SubscriptionServiceTest {
 
     @Test
     void buildCatalogTagsUpstreamBuiltinPluginAndMapsPushKey() {
-        Map<String, Object> c = config("csp_Bili"); // upstream
+        // atv_home 为上游手写条目:被内置定义合并,目录里只以 builtin 形态出现一次(不以 upstream 形态重复)
+        Map<String, Object> c = config("csp_Bili", "atv_home"); // upstream
         c.put("parses", new ArrayList<>(List.of(parse("虾米"))));
 
         Plugin plugin = new Plugin();
@@ -149,6 +150,7 @@ class SubscriptionServiceTest {
         plugin.setExternalId("stable-plugin-id");
 
         List<SubscriptionSourceService.SubscriptionSourceRef> sources = List.of(
+                new SubscriptionSourceService.SubscriptionSourceRef("builtin-atv_home", true, "atv_home", "影视首页", null),
                 new SubscriptionSourceService.SubscriptionSourceRef("builtin-csp_AList", true, "csp_AList", "🟢 AList", null),
                 new SubscriptionSourceService.SubscriptionSourceRef("builtin-csp_Push", true, "csp_Push", "推送", null),
                 new SubscriptionSourceService.SubscriptionSourceRef("plugin-1", false, "我的插件", "我的插件", plugin)
@@ -158,6 +160,10 @@ class SubscriptionServiceTest {
 
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> sites = (List<Map<String, Object>>) catalog.get("sites");
+        // WebHome 首页站随目录返回(白名单模式须可选),上游手写条目被去重,只出现一次且为 builtin
+        assertThat(sites).filteredOn(s -> "atv_home".equals(s.get("key"))).hasSize(1);
+        assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "atv_home")
+                .containsEntry("name", "影视首页").containsEntry("origin", "builtin"));
         assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "csp_Bili").containsEntry("origin", "upstream"));
         assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "csp_AList").containsEntry("origin", "builtin"));
         assertThat(sites).anySatisfy(s -> assertThat(s).containsEntry("key", "push_agent").containsEntry("origin", "builtin"));
@@ -167,6 +173,24 @@ class SubscriptionServiceTest {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> parses = (List<Map<String, Object>>) catalog.get("parses");
         assertThat(parses).extracting(p -> p.get("name")).containsExactly("虾米");
+    }
+
+    @Test
+    void webPageSiteKeyDerivesFromFileName() {
+        // 自定义网页源站点目录 key 与下发站点一致(web_ 前缀,特殊字符折叠,纯中文回落插件 id)
+        Plugin page = new Plugin();
+        page.setId(12);
+        page.setUrl("/static/webhome/pages/movie-4K.html");
+        assertThat(SubscriptionService.pluginSiteKey(page)).isEqualTo("web_movie_4K");
+
+        Plugin chinese = new Plugin();
+        chinese.setId(34);
+        chinese.setUrl("/static/webhome/pages/电影库.html");
+        assertThat(SubscriptionService.pluginSiteKey(chinese)).isEqualTo("web_34");
+
+        Plugin normal = new Plugin();
+        normal.setId(56);
+        assertThat(SubscriptionService.pluginSiteKey(normal)).isEqualTo("plugin-56");
     }
 
     @Test
@@ -203,10 +227,11 @@ class SubscriptionServiceTest {
         assertThat(SubscriptionService.selectPluginApi(plugin, false, "http://atv"))
                 .isEqualTo("csp_PyProxy");
         assertThat(payload)
-                .containsEntry("loader", "http://atv/Atvp.py?v=local-proxy-v1")
+                .containsEntry("loader", "http://atv/Atvp.py?v=" + SubscriptionService.ATVP_RUNTIME_REVISION)
                 .containsEntry("source", "http://atv/plugins/web/7.py")
                 .containsEntry("raw", true)
                 .containsEntry("api", "http://atv")
+                .containsEntry("preheatUrl", "http://atv/plugin-preheat/web")
                 .containsEntry("playbackSourceKind", "spider_plugin")
                 .containsEntry("playbackSourceKey", "stable-plugin-id")
                 .containsEntry("playbackSourceName", "短剧优选")
@@ -215,6 +240,34 @@ class SubscriptionServiceTest {
                 .containsEntry("data", "{\"site\":\"demo\"}")
                 .containsEntry("local_proxy_config", localProxyConfig);
         assertThat(payload.get("loader")).isNotEqualTo("http://atv/plugins/web/7.py");
+
+        // 有版本号时 source 地址带版本参数:预下载缓存以完整地址为 key,插件更新换地址即失效
+        plugin.setVersion(12);
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/7.py?v=12");
+        plugin.setVersion(null);
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/7.py");
+    }
+
+    @Test
+    void fileBackedPluginWithUriIllegalFileNameShouldServeRawPython() {
+        // static/plugins/ 扫描出的 url 不编码,方括号/空格文件名曾让明文 .py 误判为加密 .txt 下发 (#1081)
+        Plugin plugin = new Plugin();
+        plugin.setId(9);
+        plugin.setName("[短]红豆短剧");
+        plugin.setUrl("/static/plugins/[短]红豆短剧.py");
+
+        assertThat(SubscriptionService.pluginContentUrl("http://atv", "web", plugin))
+                .isEqualTo("http://atv/plugins/web/9.py");
+        Map<String, Object> payload = SubscriptionService.buildPluginExtPayload(
+                plugin, "http://atv", "web", "vod-token", "secret", false, Map.of());
+        assertThat(payload)
+                .containsEntry("loader", "http://atv/Atvp.py?v=" + SubscriptionService.ATVP_RUNTIME_REVISION)
+                .containsEntry("source", "http://atv/plugins/web/9.py")
+                .containsEntry("raw", true);
+        assertThat(SubscriptionService.selectPluginApi(plugin, true, "http://atv"))
+                .isEqualTo("csp_PyProxy");
     }
 
     @Test
@@ -229,7 +282,7 @@ class SubscriptionServiceTest {
                 plugin, "http://atv", "web", "", "secret", true, localProxyConfig);
 
         assertThat(SubscriptionService.selectPluginApi(plugin, true, "http://atv"))
-                .isEqualTo("http://atv/Atvp.py?v=local-proxy-v1");
+                .isEqualTo("http://atv/Atvp.py?v=" + SubscriptionService.ATVP_RUNTIME_REVISION);
         assertThat(SubscriptionService.selectPluginApi(plugin, false, "http://atv"))
                 .isEqualTo("csp_PyProxy");
         assertThat(payload)
@@ -242,7 +295,7 @@ class SubscriptionServiceTest {
         Map<String, Object> javaPayload = SubscriptionService.buildPluginExtPayload(
                 plugin, "http://atv", "web", "", "secret", false, localProxyConfig);
         assertThat(javaPayload)
-                .containsEntry("loader", "http://atv/Atvp.py?v=local-proxy-v1")
+                .containsEntry("loader", "http://atv/Atvp.py?v=" + SubscriptionService.ATVP_RUNTIME_REVISION)
                 .containsEntry("local_proxy_config", localProxyConfig);
     }
 

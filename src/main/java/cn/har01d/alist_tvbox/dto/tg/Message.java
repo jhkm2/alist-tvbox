@@ -40,7 +40,7 @@ public class Message {
     private Map<String, Object> media;
     private String validityState;
     private String validitySummary;
-    /** 来源类别:站点源(wanou/panlian/guanying/woniu)标出自身,TG 三路留空。站点源标题结构化程度更高,打分加权。 */
+    /** 来源类别:站点源(wanou/panlian/guanying/woniu/jying 等)标出自身,TG 三路留空。站点源标题结构化程度更高,打分加权。 */
     private String sourceKind;
 
     public Message() {
@@ -81,7 +81,7 @@ public class Message {
 
     public Message(cn.har01d.alist_tvbox.dto.pansou.SearchResult message, Link link) {
         this.mid = message.getMessageId();
-        this.time = message.getDatetime();
+        this.time = message.getDatetime() == null ? Instant.now() : message.getDatetime();
         this.content = message.getContent();
         this.link = link.getUrl();
         this.type = parseType(link.getUrl());

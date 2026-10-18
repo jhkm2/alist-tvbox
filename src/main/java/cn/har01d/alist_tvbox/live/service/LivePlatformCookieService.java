@@ -28,6 +28,7 @@ public class LivePlatformCookieService {
 
     static {
         COOKIE_KEYS.put("douyin", DouyinService.COOKIE_SETTING);
+        COOKIE_KEYS.put("douyu", DouyuService.COOKIE_SETTING);
         COOKIE_KEYS.put("bili", "bilibili_cookie");
         COOKIE_KEYS.put("soop", SoopService.COOKIE_SETTING);
     }
@@ -51,7 +52,8 @@ public class LivePlatformCookieService {
         return key == null ? null : settingRepository.findById(key).map(Setting::getValue).orElse("");
     }
 
-    /** 保存(空串等于清除);抖音同步失效内存态与风控冷却。 */
+    /** 保存(空串等于清除);抖音同步失效内存态与风控冷却;斗鱼记录保存时间戳(网页 Cookie 7 天时效起算点)
+     *  并做粘贴保护(passport 凭证串不带会话,只取走 LTP0/dy_did 合并进既有登录,防整串覆盖等于登出)。 */
     public void save(String platform, String cookie) {
         String key = COOKIE_KEYS.get(platform);
         if (key == null) {
@@ -60,7 +62,16 @@ public class LivePlatformCookieService {
         String value = cookie == null ? "" : cookie.trim();
         if (value.isEmpty()) {
             settingRepository.deleteById(key);
+            if ("douyu".equals(platform)) {
+                settingRepository.deleteById(DouyuService.COOKIE_SAVED_AT_SETTING);
+            }
         } else {
+            if ("douyu".equals(platform)) {
+                String existing = settingRepository.findById(key).map(Setting::getValue).orElse("");
+                value = DouyuService.normalizePastedCookie(existing, value);
+                settingRepository.save(new Setting(DouyuService.COOKIE_SAVED_AT_SETTING,
+                        String.valueOf(System.currentTimeMillis() / 1000)));
+            }
             settingRepository.save(new Setting(key, value));
         }
         if ("douyin".equals(platform)) {
@@ -78,9 +89,45 @@ public class LivePlatformCookieService {
         return switch (platform) {
             case "bili" -> verifyBili(value);
             case "douyin" -> verifyDouyin(value);
+            case "douyu" -> verifyDouyu(value);
             case "soop" -> verifySoop(value);
             default -> new String[]{"false", "不支持的平台: " + platform};
         };
+    }
+
+    /** 斗鱼无公开账号接口,登录态按 Cookie 内 token 判定(pure_live 3.1.6 同款):H5 的 acf_jwt_token/acf_auth
+     *  是 JWT 可读到期时间,网页版 dy_auth 是有效登录但读不到到期;getEncryption 仅验证连通与描述符。 */
+    private String[] verifyDouyu(String cookie) {
+        String token = DouyuService.sessionToken(cookie);
+        String stateNote;
+        if (token == null) {
+            stateNote = "游客 Cookie(未含登录凭证)";
+        } else {
+            Long expiry = DouyuService.sessionExpirySeconds(cookie, null);
+            long now = System.currentTimeMillis() / 1000;
+            if (expiry != null && expiry <= now) {
+                boolean refreshable = DouyuService.cookieField(cookie, "LTP0") != null;
+                return new String[]{"false", "登录已过期" + (refreshable ? "(含 LTP0,播放时将自动续期)" : ",请重新粘贴 Cookie")};
+            }
+            stateNote = expiry != null ? "已登录,有效至 " + java.time.Instant.ofEpochSecond(expiry)
+                    : "已登录(网页版 Cookie,未提供到期时间)";
+        }
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.set(HttpHeaders.COOKIE, cookie);
+            headers.set(HttpHeaders.USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+            headers.set(HttpHeaders.REFERER, "https://www.douyu.com/");
+            JsonNode root = restTemplate.exchange(
+                    "https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did=10000000000000000000000000001501",
+                    HttpMethod.GET, new HttpEntity<>(headers), JsonNode.class).getBody();
+            if (root.path("error").asInt(-1) == 0 && root.path("data").path("enc_data").isTextual()) {
+                return new String[]{"true", stateNote + ";请求连通正常"};
+            }
+            return new String[]{"false", "斗鱼返回结构异常: error=" + root.path("error").asInt(-1)};
+        } catch (Exception e) {
+            log.warn("verify douyu cookie failed", e);
+            return new String[]{"false", "验证请求失败: " + e.getMessage()};
+        }
     }
 
     private String[] verifyBili(String cookie) {
